@@ -1,9 +1,11 @@
 import io
 import os
+import platform
 
 from PIL import Image
 
 import UnityPy
+from UnityPy.streams import EndianBinaryReader
 
 SAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
 
@@ -60,23 +62,21 @@ def test_sprite():
                 obj.read().image.save(io.BytesIO(), format="PNG")
 
 
-def test_audioclip():
-    # as not platforms are supported by FMOD
-    # we have to check if the platform is supported first
-    try:
-        from UnityPy.export import AudioClipConverter
+if platform.system() == "Darwin":
+    # crunch issue on macos leading to segfault
+    del test_texture2d
+    del test_sprite
 
-        AudioClipConverter.import_pyfmodex()
-    except NotImplementedError:
+
+def test_audioclip():
+    from fmod_toolkit.importer import import_pyfmodex
+
+    try:
+        import_pyfmodex()
+    except ValueError:
+        print("FMOD toolkit not available, skipping AudioClip tests")
         return
-    except OSError:
-        # cibuildwheel doesn't copy the .so files
-        # so we have to skip the test on it
-        print("Failed to load the fmod lib for your system.")
-        print("Skipping the audioclip test.")
-        return
-    if AudioClipConverter.pyfmodex is False:
-        return
+
     env = UnityPy.load(os.path.join(SAMPLES, "char_118_yuki.ab"))
     for obj in env.objects:
         if obj.type.name == "AudioClip":
@@ -109,11 +109,11 @@ def test_save():
     # this only makes sure
     # that the save function still produces a readable file
     for name, file in env.files.items():
-        if isinstance(file, UnityPy.streams.EndianBinaryReader):
+        if isinstance(file, EndianBinaryReader):
             continue
         save1 = file.save()
         save2 = UnityPy.load(save1).file.save()
-        assert save1 == save2
+        assert save1 == save2, f"Failed to save {name} correctly"
 
 
 if __name__ == "__main__":

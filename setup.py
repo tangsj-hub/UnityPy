@@ -1,77 +1,124 @@
 import os
-import platform
-from setuptools import setup, Extension, find_packages
+import re
+import subprocess
+from typing import Literal, cast, get_args
 
+from setuptools import Extension, find_packages, setup
+from setuptools.command.build_ext import build_ext
+from setuptools.command.sdist import sdist
+
+try:
+    from setuptools.command.bdist_wheel import bdist_wheel
+except ImportError:
+    from wheel.bdist_wheel import bdist_wheel  # type: ignore
+
+System = Literal["Windows", "Linux", "Darwin"]
+Arch = Literal["x64", "x86", "arm", "arm64", "x86_64"]
 
 INSTALL_DIR = os.path.dirname(os.path.realpath(__file__))
 UNITYPYBOOST_DIR = os.path.join(INSTALL_DIR, "UnityPyBoost")
 
 
-def get_fmod_library():
-    # determine system - Windows, Darwin, Linux, Android
-    system = platform.system()
-    if system == "Linux" and "ANDROID_BOOTLOGO" in os.environ:
-        system = "Android"
-    # determine architecture
-    machine = platform.machine()
-    arch = platform.architecture()[0]
+class BuildExt(build_ext):
+    def build_extensions(self):
+        cpp_version_flag: str
+        compiler = self.compiler
+        # msvc - only ever used c++20, never c++2a
+        if compiler.compiler_type == "msvc":
+            cpp_version_flag = "/std:c++20"
+        # gnu & clang
+        elif compiler.compiler_type == "unix":
+            res = subprocess.run(
+                [compiler.compiler[0], "-v"],
+                capture_output=True,
+            )
+            # for some reason g++ and clang++ return this as error
+            text = (res.stdout or res.stderr).decode("utf-8")
+            version = re.search(r"version\s+(\d+)\.", text)
+            if version is None:
+                raise Exception("Failed to determine compiler version")
+            version = int(version.group(1))
+            cpp_version_flag = "-std=c++2a" if version < 10 else "-std=c++20"
+        else:
+            cpp_version_flag = "-std=c++20"
 
-    lib_name = ""
-    if system in ["Windows", "Darwin"]:
-        lib_name = "fmod.dll" if system == "Windows" else "libfmod.dylib"
-        if arch == "32bit":
-            arch = "x86"
-        elif arch == "64bit":
-            arch = "x64"
-    elif system == "Linux":
-        lib_name = "libfmod.so"
-        # Raspberry Pi and Linux on arm projects
-        if "arm" in machine:
-            if arch == "32bit":
-                arch = "armhf" if machine.endswith("l") else "arm"
-            elif arch == "64bit":
-                return None
-        elif arch == "32bit":
-            arch = "x86"
-        elif arch == "64bit":
+        for ext in self.extensions:
+            ext.extra_compile_args = [cpp_version_flag]
+
+        build_ext.build_extensions(self)
+
+
+class SDist(sdist):
+    def make_distribution(self) -> None:
+        # add all fmod libraries to the distribution
+        for root, _dirs, files in os.walk("UnityPy/lib/FMOD"):
+            for file in files:
+                fp = f"{root}/{file}"
+                if fp not in self.filelist.files:
+                    self.filelist.files.append(fp)
+        return super().make_distribution()
+
+
+BDIST_TAG_FMOD_MAP = {
+    # Windows
+    "win32": "x86",
+    "win_amd64": "x64",
+    "win_arm64": "arm",
+    # Linux and Mac endings
+    "arm64": "arm64",  # Mac
+    "x86_64": "x64",
+    "aarch64": "arm64",  # Linux
+    "i686": "x86",
+    "armv7l": "arm",  # armhf
+}
+
+
+def get_fmod_path(system: System, arch: Arch) -> str:
+    if system == "Darwin":
+        # universal dylib
+        return "lib/FMOD/Darwin/libfmod.dylib"
+
+    if system == "Windows":
+        return f"lib/FMOD/Windows/{arch}/fmod.dll"
+
+    if system == "Linux":
+        if arch == "x64":
             arch = "x86_64"
-    else:
-        return None
+        return f"lib/FMOD/Linux/{arch}/libfmod.so"
 
-    return f"lib/FMOD/{system}/{arch}/{lib_name}"
-
-
-unitypy_package_data = ["resources/uncompressed.tpk"]
-fmod_lib = get_fmod_library()
-if fmod_lib is not None:
-    unitypy_package_data.append(fmod_lib)
+    raise NotImplementedError(f"Unsupported system: {system}")
 
 
-# These packages are missing __init__.py so setuptools will warn about unspecified packages
-extra_packages = [
-    "UnityPy.resources",
-    "UnityPy.tools",
-    "UnityPy.tools.libil2cpp_helper",
-]
+class BDistWheel(bdist_wheel):  # type: ignore
+    def run(self):
+        platform_tag = self.get_tag()[2]
+        if platform_tag.startswith("win"):
+            system = "Windows"
+            arch = BDIST_TAG_FMOD_MAP[platform_tag]
+        else:
+            arch = next(
+                (v for k, v in BDIST_TAG_FMOD_MAP.items() if platform_tag.endswith(k)),
+                None,
+            )
+            system = "Darwin" if platform_tag.startswith("macosx") else "Linux"
+
+        if arch and arch in get_args(Arch):
+            self.distribution.package_data["UnityPy"].append(get_fmod_path(system, cast(Arch, arch)))
+        super().run()
 
 
 setup(
     name="UnityPy",
-    packages=find_packages() + extra_packages,
-    package_data={"UnityPy": unitypy_package_data},
+    packages=find_packages(),
+    package_data={"UnityPy": ["resources/uncompressed.tpk"]},
     ext_modules=[
         Extension(
             "UnityPy.UnityPyBoost",
-            [
-                f"UnityPyBoost/{f}"
-                for f in os.listdir(UNITYPYBOOST_DIR)
-                if f.endswith(".cpp")
-            ],
+            [f"UnityPyBoost/{f}" for f in os.listdir(UNITYPYBOOST_DIR) if f.endswith(".cpp")],
+            depends=[f"UnityPyBoost/{f}" for f in os.listdir(UNITYPYBOOST_DIR) if f.endswith(".hpp")],
             language="c++",
-            extra_compile_args=[
-                "/std:c++20" if platform.system() == "Windows" else "-std=c++20"
-            ],
             include_dirs=[UNITYPYBOOST_DIR],
         )
     ],
+    cmdclass={"build_ext": BuildExt, "sdist": SDist, "bdist_wheel": BDistWheel},
 )

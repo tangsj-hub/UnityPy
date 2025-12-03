@@ -1,22 +1,12 @@
 #define PY_SSIZE_T_CLEAN
-#pragma once
 #include <Python.h>
-#include "AnimationClip.hpp"
 #include "Mesh.hpp"
-#include "TextureSwizzler.hpp"
 #include "TypeTreeHelper.hpp"
+#include "ArchiveStorageDecryptor.hpp"
 
 /* Mesh.py */
 
 static struct PyMethodDef method_table[] = {
-    {"unpack_floats",
-     (PyCFunction)unpack_floats,
-     METH_VARARGS,
-     "replacement for PackedFloatVector.unpack_floats"},
-    {"unpack_ints",
-     (PyCFunction)unpack_ints,
-     METH_VARARGS,
-     "replacement for PackedIntVector.unpack_ints"},
     {"unpack_vertexdata",
      (PyCFunction)unpack_vertexdata,
      METH_VARARGS,
@@ -25,10 +15,10 @@ static struct PyMethodDef method_table[] = {
      (PyCFunction)read_typetree,
      METH_VARARGS | METH_KEYWORDS,
      "replacement for TypeTreeHelper.read_typetree"},
-    {"switch_deswizzle",
-     (PyCFunction)switch_deswizzle,
+     {"decrypt_block",
+     (PyCFunction)decrypt_block,
      METH_VARARGS,
-     "replacement for TextureSwizzler.switch_deswizzle"},
+     "replacement for ArchiveStorageDecryptor.decrypt_block"},
     {NULL,
      NULL,
      0,

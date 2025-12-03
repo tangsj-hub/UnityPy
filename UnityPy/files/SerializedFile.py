@@ -1,19 +1,20 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-import re
 from ntpath import basename
-from typing import TYPE_CHECKING, Dict, Generator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from attrs import define
 
 from .. import config
 from ..enums import BuildTarget, ClassIDType, CommonString
+from ..helpers.ContainerHelper import ContainerHelper
 from ..helpers.TypeTreeHelper import TypeTreeNode
+from ..helpers.UnityVersion import UnityVersion
 from ..streams import EndianBinaryWriter
 from . import BundleFile, File, ObjectReader
 
 if TYPE_CHECKING:
-    from ..classes import AssetBundle, AssetInfo, Object
+    from ..classes import AssetBundle, Object
     from ..files import ObjectReader
     from ..streams.EndianBinaryReader import EndianBinaryReader
 
@@ -24,7 +25,7 @@ class SerializedFileHeader:
     file_size: int
     version: int
     data_offset: int
-    endian: bytes
+    endian: str
     reserved: bytes
 
     def __init__(self, reader: EndianBinaryReader):
@@ -83,34 +84,20 @@ class FileIdentifier:  # external
 
     def write(self, header: SerializedFileHeader, writer: EndianBinaryWriter):
         if header.version >= 6:
+            assert self.temp_empty is not None
             writer.write_string_to_null(self.temp_empty)
         if header.version >= 5:
+            assert self.guid is not None and self.type is not None
             writer.write_bytes(self.guid)
             writer.write_int(self.type)
         writer.write_string_to_null(self.path)
 
 
-@define(slots=True)
-class BuildType:
-    build_type: str
-
-    def __init__(self, build_type):
-        self.build_type = build_type
-
-    @property
-    def IsAlpha(self):
-        return self.build_type == "a"
-
-    @property
-    def IsPatch(self):
-        return self.build_type == "p"
-
-
-@define(slots=True)
+@define(slots=True, init=False)
 class SerializedType:
     class_id: int
     is_stripped_type: Optional[bool] = None
-    script_type_index: Optional[int] = -1
+    script_type_index: int = -1
     script_id: Optional[bytes] = None  # Hash128
     old_type_hash: Optional[bytes] = None  # Hash128
     node: Optional[TypeTreeNode] = None
@@ -119,7 +106,7 @@ class SerializedType:
     m_NameSpace: Optional[str] = None
     m_AssemblyName: Optional[str] = None
     # 21+
-    type_dependencies: Optional[List[int]] = None
+    type_dependencies: Optional[Tuple[int, ...]] = None
 
     def __init__(
         self,
@@ -129,6 +116,7 @@ class SerializedType:
     ):
         version = serialized_file.header.version
         self.class_id = reader.read_int()
+        self.__attrs_init__(self.class_id)
 
         if version >= 16:
             self.is_stripped_type = reader.read_boolean()
@@ -169,9 +157,11 @@ class SerializedType:
         writer.write_int(self.class_id)
 
         if version >= 16:
+            assert self.is_stripped_type is not None
             writer.write_boolean(self.is_stripped_type)
 
         if version >= 17:
+            assert self.script_type_index is not None
             writer.write_short(self.script_type_index)
 
         if version >= 13:
@@ -180,7 +170,9 @@ class SerializedType:
                 or (version < 16 and self.class_id < 0)
                 or (version >= 16 and self.class_id == 114)
             ):
+                assert self.script_id is not None
                 writer.write_bytes(self.script_id)  # Hash128
+            assert self.old_type_hash is not None
             writer.write_bytes(self.old_type_hash)  # Hash128
 
         if serialized_file._enable_type_tree:
@@ -192,35 +184,41 @@ class SerializedType:
 
             if version >= 21:
                 if is_ref_type:
+                    assert (
+                        self.m_ClassName is not None
+                        and self.m_NameSpace is not None
+                        and self.m_AssemblyName is not None
+                    )
                     writer.write_string_to_null(self.m_ClassName)
                     writer.write_string_to_null(self.m_NameSpace)
                     writer.write_string_to_null(self.m_AssemblyName)
                 else:
+                    assert self.type_dependencies is not None
                     writer.write_int_array(self.type_dependencies, True)
 
     @property
-    def nodes(self) -> Union[TypeTreeNode, None]:
+    def nodes(self) -> Optional[TypeTreeNode]:
         # for compatibility with old versions
         return self.node
 
 
 class SerializedFile(File.File):
     reader: EndianBinaryReader
+    version: UnityVersion
     unity_version: str
-    build_type: BuildType
     target_platform: BuildTarget
     _enable_type_tree: bool
     types: List[SerializedType]
     script_types: List[LocalSerializedObjectIdentifier]
     externals: List[FileIdentifier]
+    ref_types: Optional[List[SerializedType]]
     objects: Dict[int, ObjectReader]
     unknown: int
     header: SerializedFileHeader
     _m_target_platform: int
     big_id_enabled: int
     userInformation: Optional[str]
-    assetbundle: AssetBundle
-    container: ContainerHelper
+    assetbundle: Optional[AssetBundle]
     _cache: Dict[str, Object]
 
     @property
@@ -238,8 +236,6 @@ class SerializedFile(File.File):
         self.reader = reader
 
         self.unity_version = "2.5.0f5"
-        self.version = (0, 0, 0, 0)
-        self.build_type = BuildType("")
         self.target_platform = BuildTarget.UnknownPlatform
         self._enable_type_tree = True
         self.types = []
@@ -300,22 +296,15 @@ class SerializedFile(File.File):
         # Read Scripts
         if header.version >= 11:
             script_count = reader.read_int()
-            self.script_types = [
-                LocalSerializedObjectIdentifier(header, reader)
-                for _ in range(script_count)
-            ]
+            self.script_types = [LocalSerializedObjectIdentifier(header, reader) for _ in range(script_count)]
 
         # Read Externals
         externals_count = reader.read_int()
-        self.externals = [
-            FileIdentifier(header, reader) for _ in range(externals_count)
-        ]
+        self.externals = [FileIdentifier(header, reader) for _ in range(externals_count)]
 
         if header.version >= 20:
             ref_type_count = reader.read_int()
-            self.ref_types = [
-                SerializedType(reader, self, True) for _ in range(ref_type_count)
-            ]
+            self.ref_types = [SerializedType(reader, self, True) for _ in range(ref_type_count)]
 
         if config.SERIALIZED_FILE_PARSE_TYPETREE is False:
             self._enable_type_tree = False
@@ -331,13 +320,13 @@ class SerializedFile(File.File):
                 break
         else:
             self.assetbundle = None
-            self._container = ContainerHelper({})
+            self._container = ContainerHelper([])
 
     @property
     def container(self):
         return self._container
 
-    def load_dependencies(self, possible_dependencies: list = []):
+    def load_dependencies(self, possible_dependencies: Optional[list] = None):
         """Load all external dependencies.
 
         Parameters
@@ -348,6 +337,10 @@ class SerializedFile(File.File):
         """
         for file_id in self.externals:
             self.environment.load_file(file_id.path, True)
+
+        if possible_dependencies is None:
+            return
+
         for dependency in possible_dependencies:
             try:
                 self.environment.load_file(dependency, True)
@@ -363,19 +356,14 @@ class SerializedFile(File.File):
                 string_version = self.parent.version_engine
             if not string_version or string_version == "0.0.0":
                 string_version = config.get_fallback_version()
-        build_type = re.findall(r"([^\d.])", string_version)
-        self.build_type = BuildType(build_type[0] if build_type else "")
-        version_split = re.split(r"\D", string_version)
-        self.version = tuple(int(x) for x in version_split[:4])
+        self.version = UnityVersion.from_str(string_version)
 
     def get_writeable_cab(self, name: str = "CAB-UnityPy_Mod.resS"):
         """
         Creates a new cab file in the bundle that contains the given data.
         This is usefull for asset types that use resource files.
         """
-        if not isinstance(
-            self.parent, (File.BundleFile.BundleFile, File.WebFile.WebFile)
-        ):
+        if not isinstance(self.parent, (File.BundleFile.BundleFile, File.WebFile.WebFile)):
             return None
 
         cab = self.parent.get_writeable_cab(name)
@@ -397,7 +385,7 @@ class SerializedFile(File.File):
 
         return cab
 
-    def save(self, packer: str = None) -> bytes:
+    def save(self, packer: Optional[str] = None) -> bytes:
         # 1. header -> has to be delayed until the very end
         # 2. data -> types, objects, scripts, ...
 
@@ -441,11 +429,13 @@ class SerializedFile(File.File):
             external.write(header, meta_writer)
 
         if header.version >= 20:
+            assert self.ref_types is not None
             meta_writer.write_int(len(self.ref_types))
             for ref_type in self.ref_types:
                 ref_type.write(self, meta_writer, True)
 
         if header.version >= 5:
+            assert self.userInformation is not None
             meta_writer.write_string_to_null(self.userInformation)
 
         # prepare header
@@ -510,55 +500,3 @@ def read_string(string_buffer_reader: EndianBinaryReader, value: int) -> str:
 
     offset = value & 0x7FFFFFFF
     return CommonString.get(offset, str(offset))
-
-
-@define(slots=True)
-class ContainerHelper:
-    """Helper class to allow multidict containers
-    without breaking compatibility with old versions"""
-
-    container: Tuple[str, AssetInfo]
-    container_dict: Dict[str, ObjectReader]
-    path_dict: Dict[int, str]
-
-    def __init__(self, assetbundle: AssetBundle) -> None:
-        self.container = assetbundle.m_Container
-        # support for getitem
-        self.container_dict = {key: value.asset for key, value in self.container}
-        self.path_dict = {value.asset.m_PathID: key for key, value in self.container}
-
-    def items(self) -> Generator[Tuple[str, ObjectReader], None, None]:
-        return ((key, value.asset) for key, value in self.container)
-
-    def keys(self) -> list[str]:
-        return list({key for key, value in self.container})
-
-    def values(self) -> list[ObjectReader]:
-        return list({value.asset for key, value in self.container})
-
-    def __getitem__(self, key) -> ObjectReader:
-        return self.container_dict[key]
-
-    def __setitem__(self, key, value) -> None:
-        raise NotImplementedError("Assigning to container is not allowed!")
-
-    def __delitem__(self, key) -> None:
-        raise NotImplementedError("Deleting from the container is not allowed!")
-
-    def __iter__(self) -> Generator[str, None, None]:
-        return iter(self.keys())
-
-    def __len__(self) -> int:
-        return len(self.container)
-
-    def __getattr__(self, name: str) -> ObjectReader:
-        return self.container_dict[name]
-
-    def __or__(self, other: ContainerHelper):
-        return ContainerHelper(list(set(self.container + other.container)))
-
-    def __str__(self) -> str:
-        return f'{{{", ".join(f"{key}: {value}" for key, value in self.items())}}}'
-
-    def __dict__(self) -> Dict[str, ObjectReader]:
-        return self.container_dict

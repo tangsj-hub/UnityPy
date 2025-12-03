@@ -1,6 +1,18 @@
 from __future__ import annotations
+
+import re
 from struct import Struct
-from typing import Optional, List, Tuple, TYPE_CHECKING, Dict, Iterator
+from threading import Lock
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
 
 from attrs import define, field
 
@@ -11,7 +23,7 @@ if TYPE_CHECKING:
     from .Tpk import UnityVersion
 
 try:
-    from ..UnityPyBoost import TypeTreeNode as TypeTreeNodeC
+    from ..UnityPyBoost import TypeTreeNode as TypeTreeNodeC  # type: ignore
 except ImportError:
 
     @define(slots=True)
@@ -27,6 +39,32 @@ except ImportError:
         m_Index: Optional[int] = None
         m_MetaFlag: Optional[int] = None
         m_RefTypeHash: Optional[int] = None
+        _clean_name: str = field(init=False)
+
+        def __attrs_post_init__(self):
+            self._clean_name = clean_name(self.m_Name)
+
+        def __repr__(self):
+            return f"TypeTreeNode(m_Level={self.m_Level}, m_Type='{self.m_Type}', \
+                m_Name='{self.m_Name}', m_MetaFlag={self.m_MetaFlag})"
+
+
+TYPETREENODE_KEYS = [
+    "m_Level",
+    "m_Type",
+    "m_Name",
+    "m_ByteSize",
+    "m_Version",
+    "m_Children",
+    "m_TypeFlags",
+    "m_VariableCount",
+    "m_Index",
+    "m_MetaFlag",
+    "m_RefTypeHash",
+]
+
+SYSTEM_GLOBAL_LOCK = Lock()
+NAME_PEEK_NODE_CACHE: dict[Tuple[str, str, int], Union[Tuple[TypeTreeNode, str], None]] = {}
 
 
 class TypeTreeNode(TypeTreeNodeC):
@@ -34,15 +72,15 @@ class TypeTreeNode(TypeTreeNodeC):
         stack: list[TypeTreeNode] = [self]
         while stack:
             node = stack.pop()
-            stack.extend(reversed(node.m_Children))
             yield node
+            stack.extend(reversed(node.m_Children))
 
     @classmethod
     def parse(cls, reader: EndianBinaryReader, version: int) -> TypeTreeNode:
         # stack approach is way faster than recursion
         # using a fake root node to avoid special case for root node
-        dummy_node = cls(-1, "", "", 0, 0, 0, [])
-        dummy_root = cls(-1, "", "", 0, 0, 0, [dummy_node])
+        dummy_node = cls(-1, "", "", 0, 0, [])
+        dummy_root = cls(-1, "", "", 0, 0, [dummy_node])
 
         stack: List[Tuple[TypeTreeNode, int]] = [(dummy_root, 1)]
         while stack:
@@ -77,9 +115,7 @@ class TypeTreeNode(TypeTreeNodeC):
 
         node_struct, keys = _get_blob_node_struct(reader.endian, version)
         struct_data = reader.read(node_struct.size * node_count)
-        stringbuffer_reader = EndianBinaryReader(
-            reader.read(stringbuffer_size), reader.endian
-        )
+        stringbuffer_reader = EndianBinaryReader(reader.read(stringbuffer_size), reader.endian)
 
         CommonString = get_common_strings()
 
@@ -118,16 +154,27 @@ class TypeTreeNode(TypeTreeNodeC):
         return fake_root.m_Children[0]
 
     @classmethod
-    def from_list(cls, nodes: List[dict]) -> TypeTreeNode:
+    def from_list(cls, nodes: Union[List[Dict[str, Union[str, int]]], List[TypeTreeNode]]) -> TypeTreeNode:
         fake_root: TypeTreeNode = cls(-1, "", "", 0, 0, [])
         stack: List[TypeTreeNode] = [fake_root]
         parent = fake_root
         prev = fake_root
 
-        for node in nodes:
-            if isinstance(node, dict):
-                node = cls(node)
+        # check if the nodes contain all required fields
+        if isinstance(nodes[0], dict):
+            if "m_Level" not in nodes[0] or "m_Type" not in nodes[0] or "m_Name" not in nodes[0]:
+                raise ValueError("Nodes must contain at least m_Level, m_Type and m_Name")
+            patch_dict = {}
+            if "m_ByteSize" not in nodes[0]:
+                patch_dict["m_ByteSize"] = 0
+            if "m_Version" not in nodes[0]:
+                patch_dict["m_Version"] = 0
+            nodes = [cls(**node, **patch_dict) for node in nodes]  # type: ignore
 
+        if TYPE_CHECKING:
+            nodes = cast(List[TypeTreeNode], nodes)
+
+        for node in nodes:
             if node.m_Level > prev.m_Level:
                 stack.append(parent)
                 parent = prev
@@ -139,6 +186,29 @@ class TypeTreeNode(TypeTreeNodeC):
             prev = node
 
         return fake_root.m_Children[0]
+
+    def get_name_peek_node(self) -> Union[Tuple[TypeTreeNode, str], None]:
+        global SYSTEM_GLOBAL_LOCK
+        with SYSTEM_GLOBAL_LOCK:
+            key = (self.m_Name, self.m_Type, self.m_Version)
+            if key in NAME_PEEK_NODE_CACHE:
+                return NAME_PEEK_NODE_CACHE[key]
+
+            result: Union[Tuple[TypeTreeNode, str], None] = None
+            for i, child in enumerate(self.m_Children):
+                if child.m_Name in ("m_Name", "name"):
+                    peek_node = TypeTreeNode(
+                        self.m_Level,
+                        self.m_Type,
+                        self.m_Name,
+                        self.m_ByteSize,
+                        self.m_Version,
+                        self.m_Children[: i + 1],
+                    )
+                    result = peek_node, child.m_Name
+                    break
+            NAME_PEEK_NODE_CACHE[key] = result
+            return result
 
     def dump(self, writer: EndianBinaryWriter, version: int):
         stack: list[TypeTreeNode] = [self]
@@ -154,7 +224,7 @@ class TypeTreeNode(TypeTreeNodeC):
             if version != 3:
                 assert self.m_Index is not None
                 writer.write_int(self.m_Index)
-            writer.write_int(self.m_TypeFlags)
+            writer.write_int(self.m_TypeFlags or 0)
             writer.write_int(self.m_Version)
             if version != 3:
                 assert self.m_MetaFlag is not None
@@ -169,9 +239,7 @@ class TypeTreeNode(TypeTreeNodeC):
         string_writer = EndianBinaryWriter()
 
         # string buffer setup
-        CommonStringOffsetMap = {
-            string: offset for offset, string in get_common_strings().items()
-        }
+        CommonStringOffsetMap = {string: offset for offset, string in get_common_strings().items()}
 
         string_offsets: dict[str, int] = {}
 
@@ -212,11 +280,26 @@ class TypeTreeNode(TypeTreeNodeC):
     def dump_structure(self, indent: str = "  ") -> str:
         # dump structure similar to https://github.com/AssetRipper/TypeTreeDumps/blob/main/StructsDump
         sb = [
-            f"{indent}{self.m_Type} {self.m_Name} // ByteSize{{{self.m_ByteSize:X}}}, Index{{{self.m_Index}}}, Version{{{self.m_Version}}}, TypeFlags{{{self.m_TypeFlags}}}, MetaFlag{{{self.m_MetaFlag}}}"
+            f"{indent}{self.m_Type} {self.m_Name} // ByteSize{{{self.m_ByteSize:X}}}, Index{{{self.m_Index}}}, \
+                Version{{{self.m_Version}}}, TypeFlags{{{self.m_TypeFlags}}}, MetaFlag{{{self.m_MetaFlag}}}"
         ]
         for child in self.m_Children:
             sb.append(child.dump_structure(indent + "  "))
         return "\n".join(sb)
+
+    def to_dict(self) -> dict:
+        return {
+            key: value for key, value in ((key, getattr(self, key)) for key in TYPETREENODE_KEYS) if value is not None
+        }
+
+    def to_dict_list(self) -> List[dict]:
+        return [
+            self.to_dict(),
+            *(item for child in self.m_Children for item in child.to_dict_list()),
+        ]
+
+    def __eq__(self, other: TypeTreeNode) -> bool:  # type: ignore
+        return self.to_dict() == other.to_dict() and self.m_Children == other.m_Children
 
 
 COMMONSTRING_CACHE: Dict[Optional[UnityVersion], Dict[int, str]] = {}
@@ -262,3 +345,26 @@ def _get_blob_node_struct(endian: str, version: int) -> tuple[Struct, list[str]]
         keys.append("m_RefTypeHash")
 
     return Struct(struct_type), keys
+
+
+def clean_name(name: str) -> str:
+    # keep in sync with TypeTreeHelper.cpp
+    if len(name) == 0:
+        return name
+    if name.startswith("(int&)"):
+        name = name[6:]
+    if name.endswith("?"):
+        name = name[:-1]
+    name = re.sub(r"[ \.:\-\[\]]", "_", name)
+    if name in ["pass", "from"]:
+        name += "_"
+    if name[0].isdigit():
+        name = f"x{name}"
+    return name
+
+
+__all__ = (
+    "TypeTreeNode",
+    "get_common_strings",
+    "clean_name",
+)

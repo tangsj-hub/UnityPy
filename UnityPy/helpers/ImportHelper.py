@@ -1,16 +1,19 @@
 from __future__ import annotations
+
+import io
 import os
-from typing import Union, List
-from .CompressionHelper import BROTLI_MAGIC, GZIP_MAGIC
+from typing import List, Optional, Tuple, Union
+
+from .. import files
 from ..enums import FileType
 from ..streams import EndianBinaryReader
-from .. import files
+from .CompressionHelper import BROTLI_MAGIC, GZIP_MAGIC
+
+FileSourceType = Union[str, bytes, bytearray, io.IOBase, EndianBinaryReader]
 
 
 def file_name_without_extension(file_name: str) -> str:
-    return os.path.join(
-        os.path.dirname(file_name), os.path.splitext(os.path.basename(file_name))[0]
-    )
+    return os.path.join(os.path.dirname(file_name), os.path.splitext(os.path.basename(file_name))[0])
 
 
 def list_all_files(directory: str) -> List[str]:
@@ -18,7 +21,7 @@ def list_all_files(directory: str) -> List[str]:
         val
         for sublist in [
             [os.path.join(dir_path, filename) for filename in filenames]
-            for (dir_path, dirn_ames, filenames) in os.walk(directory)
+            for (dir_path, dirnames, filenames) in os.walk(directory)
             if ".git" not in dir_path
         ]
         for val in sublist
@@ -29,28 +32,23 @@ def find_all_files(directory: str, search_str: str) -> List[str]:
     return [
         val
         for sublist in [
-            [
-                os.path.join(dir_path, filename)
-                for filename in filenames
-                if search_str in filename
-            ]
-            for (dir_path, dirn_ames, filenames) in os.walk(directory)
+            [os.path.join(dir_path, filename) for filename in filenames if search_str in filename]
+            for (dir_path, dirnames, filenames) in os.walk(directory)
             if ".git" not in dir_path
         ]
         for val in sublist
     ]
 
 
-def check_file_type(input_) -> Union[FileType, EndianBinaryReader]:
+def check_file_type(
+    input_: FileSourceType,
+) -> Tuple[FileType, EndianBinaryReader]:
     if isinstance(input_, str) and os.path.isfile(input_):
         reader = EndianBinaryReader(open(input_, "rb"))
     elif isinstance(input_, EndianBinaryReader):
         reader = input_
     else:
-        try:
-            reader = EndianBinaryReader(input_)
-        except:
-            return None, None
+        reader = EndianBinaryReader(input_)
 
     if reader.Length < 20:
         return FileType.ResourceFile, reader
@@ -61,11 +59,11 @@ def check_file_type(input_) -> Union[FileType, EndianBinaryReader]:
     if signature in [
         "UnityWeb",
         "UnityRaw",
-        "\xFA\xFA\xFA\xFA\xFA\xFA\xFA\xFA",
+        "\xfa\xfa\xfa\xfa\xfa\xfa\xfa\xfa",
         "UnityFS",
     ]:
         return FileType.BundleFile, reader
-    elif signature == "UnityWebData1.0":
+    elif signature.startswith(("UnityWebData", "TuanjieWebData")):
         return FileType.WebFile, reader
     elif signature == "PK\x03\x04":
         return FileType.ZIP, reader
@@ -94,12 +92,13 @@ def check_file_type(input_) -> Union[FileType, EndianBinaryReader]:
         data_offset = reader.read_u_int()
 
         if version >= 22:
-            endian = ">" if reader.read_boolean() else "<"
-            reserved = reader.read_bytes(3)
+            raw_endian = reader.read_u_byte()
+            _endian = ">" if raw_endian else "<"
+            _reserved = reader.read_bytes(3)
             metadata_size = reader.read_u_int()
             file_size = reader.read_long()
             data_offset = reader.read_long()
-            unknown = reader.read_long()  # unknown
+            _unknown = reader.read_long()  # unknown
 
         # reset
         reader.endian = old_endian
@@ -109,10 +108,7 @@ def check_file_type(input_) -> Union[FileType, EndianBinaryReader]:
             (
                 version < 0,
                 version > 100,
-                *[
-                    x < 0 or x > reader.Length
-                    for x in [file_size, metadata_size, version, data_offset]
-                ],
+                *[x < 0 or x > reader.Length for x in [file_size, metadata_size, version, data_offset]],
                 file_size < metadata_size,
                 file_size < data_offset,
             )
@@ -124,15 +120,21 @@ def check_file_type(input_) -> Union[FileType, EndianBinaryReader]:
 
 def parse_file(
     reader: EndianBinaryReader,
-    parent,
+    parent: files.File,
     name: str,
-    typ: FileType = None,
-    is_dependency=False,
+    typ: Optional[FileType] = None,
+    is_dependency: bool = False,
 ) -> Union[files.File, EndianBinaryReader]:
     if typ is None:
         typ, _ = check_file_type(reader)
     if typ == FileType.AssetsFile and not name.endswith(
-        (".resS", ".resource", ".config", ".xml", ".dat")
+        (
+            ".resS",
+            ".resource",
+            ".config",
+            ".xml",
+            ".dat",
+        )
     ):
         f = files.SerializedFile(reader, parent, name=name, is_dependency=is_dependency)
     elif typ == FileType.BundleFile:

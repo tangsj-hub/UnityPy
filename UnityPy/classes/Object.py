@@ -1,6 +1,7 @@
 from __future__ import annotations
+
 from abc import ABC, ABCMeta
-from typing import TYPE_CHECKING, Dict, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
     from ..files.ObjectReader import ObjectReader
@@ -30,3 +31,8 @@ class Object(ABC, metaclass=ABCMeta):
             raise ValueError("ObjectReader not set")
 
         self.object_reader.save_typetree(self)
+
+
+__all__ = [
+    "Object",
+]

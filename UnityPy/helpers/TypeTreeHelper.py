@@ -1,14 +1,18 @@
-﻿from __future__ import annotations
-import re
-from typing import Optional, Any, Union, TYPE_CHECKING
+from __future__ import annotations
 
-from .TypeTreeNode import TypeTreeNode
-from ..streams.EndianBinaryReader import EndianBinaryReader
-from ..streams.EndianBinaryWriter import EndianBinaryWriter
+import re
+from sys import version_info as py_version_info
+from typing import TYPE_CHECKING, Any, Optional, Union
+
+from attrs import define
 
 from .. import classes
+from ..streams.EndianBinaryReader import EndianBinaryReader
+from ..streams.EndianBinaryWriter import EndianBinaryWriter
+from .TypeTreeNode import TypeTreeNode
 
 Object = classes.Object
+UnknownObject = classes.UnknownObject
 PPtr = classes.PPtr
 
 if TYPE_CHECKING:
@@ -46,6 +50,7 @@ FUNCTION_READ_MAP = {
     "string": EndianBinaryReader.read_aligned_string,
     "TypelessData": EndianBinaryReader.read_byte_array,
 }
+
 FUNCTION_READ_MAP_ARRAY = {
     "SInt8": EndianBinaryReader.read_byte_array,
     "UInt8": EndianBinaryReader.read_u_byte_array,
@@ -70,11 +75,57 @@ FUNCTION_READ_MAP_ARRAY = {
 }
 
 
+@define(slots=True)
+class TypeTreeConfig:
+    as_dict: bool
+    assetsfile: "Optional[SerializedFile]" = None
+    has_registry: bool = False
+
+    def copy(self) -> TypeTreeConfig:
+        return TypeTreeConfig(self.as_dict, self.assetsfile, self.has_registry)
+
+
+def get_ref_type_node(ref_object: dict, assetfile: SerializedFile) -> Optional[TypeTreeNode]:
+    typ = ref_object["type"]
+    if isinstance(typ, dict):
+        cls = typ["class"]
+        ns = typ["ns"]
+        asm = typ["asm"]
+    else:
+        cls = getattr(typ, "class")
+        ns = typ.ns
+        asm = typ.asm
+
+    if not assetfile or not assetfile.ref_types:
+        raise ValueError("SerializedFile has no ref_types")
+
+    if cls == "":
+        return None
+
+    for ref_type in assetfile.ref_types:
+        if cls == ref_type.m_ClassName and ns == ref_type.m_NameSpace and asm == ref_type.m_AssemblyName:
+            return ref_type.node
+    else:
+        raise ValueError(f"Referenced type not found: {cls} {ns} {asm}")
+
+
+if py_version_info >= (3, 14):
+    from annotationlib import get_annotations as annotationlib_get_annotations
+
+    def get_annotation_keys(clz) -> set[str]:
+        return set(annotationlib_get_annotations(clz).keys())
+else:
+
+    def get_annotation_keys(clz) -> set[str]:
+        return set(clz.__annotations__)
+
+
 def read_typetree(
     root_node: TypeTreeNode,
     reader: EndianBinaryReader,
     as_dict: bool = True,
-    expected_read: Optional[int] = None,
+    byte_size: Optional[int] = None,
+    check_read: bool = True,
     assetsfile: Optional[SerializedFile] = None,
 ) -> Union[dict[str, Any], Object]:
     """Reads the typetree of the object contained in the reader via the node list.
@@ -91,20 +142,18 @@ def read_typetree(
     dict | objects.Object
         The parsed typtree
     """
-    if expected_read and read_typetree_boost:
-        data = reader.read_bytes(expected_read)
-        return read_typetree_boost(
-            data, root_node, reader.endian, as_dict, assetsfile, classes, clean_name
-        )
+    bytes_read: int
+    if byte_size and read_typetree_boost:
+        data = reader.read_bytes(byte_size)
+        obj, bytes_read = read_typetree_boost(data, root_node, reader.endian, as_dict, assetsfile, classes)
+    else:
+        pos = reader.Position
+        config = TypeTreeConfig(as_dict, assetsfile, False)
+        obj = read_value(root_node, reader, config)
+        bytes_read = reader.Position - pos
 
-    pos = reader.Position
-    obj = read_value(root_node, reader, as_dict, assetsfile)
-
-    read = reader.Position - pos
-    if expected_read is not None and read != expected_read:
-        raise ValueError(
-            f"Expected to read {expected_read} bytes, but read {read} bytes"
-        )
+    if check_read and bytes_read != byte_size:
+        raise ValueError(f"Expected to read {byte_size} bytes, but only read {bytes_read} bytes")
 
     return obj
 
@@ -113,6 +162,7 @@ def write_typetree(
     value: Union[dict[str, Any], Object],
     root_node: TypeTreeNode,
     writer: EndianBinaryWriter,
+    assetsfile: Optional[SerializedFile] = None,
 ) -> None:
     """Writes the typetree of the object contained in the reader via the node list.
 
@@ -125,14 +175,14 @@ def write_typetree(
     writer : EndianBinaryWriter
         Writer of the object to be parsed
     """
-    return write_value(value, root_node, writer)
+    config = TypeTreeConfig(isinstance(value, dict), assetsfile, False)
+    return write_value(value, root_node, writer, config)
 
 
 def read_value(
     node: TypeTreeNode,
     reader: EndianBinaryReader,
-    as_dict: bool,
-    assetsfile: Optional[SerializedFile],
+    config: TypeTreeConfig,
 ) -> Any:
     # print(reader.Position, node.m_Name, node.m_Type, node.m_MetaFlag)
     align = metaflag_is_aligned(node.m_MetaFlag)
@@ -141,9 +191,19 @@ def read_value(
     if func:
         value = func(reader)
     elif node.m_Type == "pair":
-        first = read_value(node.m_Children[0], reader, as_dict, assetsfile)
-        second = read_value(node.m_Children[1], reader, as_dict, assetsfile)
+        first = read_value(node.m_Children[0], reader, config)
+        second = read_value(node.m_Children[1], reader, config)
         value = (first, second)
+    elif node.m_Type == "ReferencedObject":
+        value = {}
+        for child in node.m_Children:
+            if child.m_Type == "ReferencedObjectData":
+                ref_type_nodes = get_ref_type_node(value, config.assetsfile)
+                if ref_type_nodes is None:
+                    continue
+                value[child.m_Name] = read_value(ref_type_nodes, reader, config)
+            else:
+                value[child.m_Name] = read_value(child, reader, config)
     # Vector
     elif node.m_Children and node.m_Children[0].m_Type == "Array":
         if metaflag_is_aligned(node.m_Children[0].m_MetaFlag):
@@ -151,44 +211,51 @@ def read_value(
 
         # size = read_value(node.m_Children[0].m_Children[0], reader, as_dict)
         size = reader.read_int()
+        if size < 0:
+            raise ValueError("Negative length read from TypeTree")
         subtype = node.m_Children[0].m_Children[1]
         if metaflag_is_aligned(subtype.m_MetaFlag):
-            value = read_value_array(subtype, reader, as_dict, size, assetsfile)
+            value = read_value_array(subtype, reader, config, size)
         else:
-            value = [
-                read_value(subtype, reader, as_dict, assetsfile) for _ in range(size)
-            ]
+            value = [read_value(subtype, reader, config) for _ in range(size)]
 
     else:  # Class
-        value = {
-            child.m_Name: read_value(child, reader, as_dict, assetsfile)
-            for child in node.m_Children
-        }
+        value = {}
+        for child in node.m_Children:
+            if child.m_Type == "ManagedReferencesRegistry":
+                if config.has_registry:
+                    continue
+                else:
+                    config = config.copy()
+                    config.has_registry = True
+            value[child.m_Name if config.as_dict else child._clean_name] = read_value(child, reader, config)
 
-        if not as_dict:
+        if not config.as_dict:
             if node.m_Type.startswith("PPtr<"):
                 value = PPtr[Any](
-                    assetsfile=assetsfile,
+                    assetsfile=config.assetsfile,
                     m_FileID=value["m_FileID"],
                     m_PathID=value["m_PathID"],
-                    type=node.m_Type[6:-1],
                 )
             else:
-                clz = getattr(classes, node.m_Type, Object)
-                clz_kwargs = {clean_name(key): value for key, value in value.items()}
+                clz = getattr(classes, node.m_Type, UnknownObject)
                 try:
-                    value = clz(**clz_kwargs)
+                    value = clz(**value)
                 except TypeError:
-                    extra_keys = set(clz_kwargs.keys()) - set(clz.__annotations__)
-                    value = clz(
-                        **{
-                            key: value
-                            for key, value in clz_kwargs.items()
-                            if key in clz.__annotations__
-                        }
-                    )
-                    for key in extra_keys:
-                        setattr(value, key, clz_kwargs[key])
+                    keys = set(value.keys())
+                    annotation_keys = get_annotation_keys(clz)
+                    missing_keys = annotation_keys - keys
+                    if clz is UnknownObject or missing_keys:
+                        value = UnknownObject(node, **value)
+                    else:
+                        extra_keys = keys - annotation_keys
+                        if extra_keys:
+                            instance = clz(**{key: value[key] for key in annotation_keys})
+                            for key in extra_keys:
+                                setattr(instance, key, value[key])
+                            value = instance
+                        else:
+                            value = UnknownObject(**value)
 
     if align:
         reader.align_stream()
@@ -199,9 +266,8 @@ def read_value(
 def read_value_array(
     node: TypeTreeNode,
     reader: EndianBinaryReader,
-    as_dict: bool,
+    config: TypeTreeConfig,
     size: int,
-    assetsfile: Optional[SerializedFile],
 ) -> Any:
     align = metaflag_is_aligned(node.m_MetaFlag)
 
@@ -218,92 +284,78 @@ def read_value_array(
 
         key_func = FUNCTION_READ_MAP.get(
             key_node.m_Type,
-            lambda reader: read_value(key_node, reader, as_dict, assetsfile),
+            lambda reader: read_value(key_node, reader, config),
         )
         value_func = FUNCTION_READ_MAP.get(
             value_node.m_Type,
-            lambda reader: read_value(value_node, reader, as_dict, assetsfile),
+            lambda reader: read_value(value_node, reader, config),
         )
         value = [(key_func(reader), value_func(reader)) for _ in range(size)]
+    elif node.m_Type == "ReferencedObject":
+        value = [None] * size
+        for i in range(size):
+            item = {}
+            for child in node.m_Children:
+                if child.m_Type == "ReferencedObjectData":
+                    ref_type_nodes = get_ref_type_node(item, config.assetsfile)
+                    item[child.m_Name] = read_value(ref_type_nodes, reader, config)
+                else:
+                    item[child.m_Name] = read_value(child, reader, config)
+            value[i] = item
     # Vector
     elif node.m_Children and node.m_Children[0].m_Type == "Array":
         if metaflag_is_aligned(node.m_Children[0].m_MetaFlag):
             align = True
         subtype = node.m_Children[0].m_Children[1]
         if metaflag_is_aligned(subtype.m_MetaFlag):
+            value = [read_value_array(subtype, reader, config, reader.read_int()) for _ in range(size)]
+        else:
+            value = [[read_value(subtype, reader, config) for _ in range(reader.read_int())] for _ in range(size)]
+    else:  # Class
+        if config.as_dict:
             value = [
-                read_value_array(
-                    subtype, reader, as_dict, reader.read_int(), assetsfile
+                {child.m_Name: read_value(child, reader, config) for child in node.m_Children} for _ in range(size)
+            ]
+        elif node.m_Type.startswith("PPtr<"):
+            value = [
+                PPtr[Any](
+                    assetsfile=config.assetsfile,
+                    **{child.m_Name: read_value(child, reader, config) for child in node.m_Children},
                 )
                 for _ in range(size)
             ]
         else:
-            value = [
-                [
-                    read_value(subtype, reader, as_dict, assetsfile)
-                    for _ in range(reader.read_int())
-                ]
-                for _ in range(size)
-            ]
-    else:  # Class
-        if as_dict:
-            value = [
-                {
-                    child.m_Name: read_value(child, reader, as_dict, assetsfile)
-                    for child in node.m_Children
-                }
-                for _ in range(size)
-            ]
-        else:
-            if node.m_Type.startswith("PPtr<"):
+            clz = getattr(
+                classes,
+                node.m_Type,
+                UnknownObject,
+            )
+            keys = set(child._clean_name for child in node.m_Children)
+            annotation_keys = get_annotation_keys(clz)
+            missing_keys = annotation_keys - keys
+            extra_keys = keys - annotation_keys
+            if missing_keys or clz is UnknownObject:
                 value = [
-                    PPtr[Any](
-                        assetsfile=assetsfile,
-                        type=node.m_Type[6:-1],
-                        **{
-                            child.m_Name: read_value(child, reader, as_dict, assetsfile)
-                            for child in node.m_Children
-                        },
+                    UnknownObject(
+                        node,
+                        **{child._clean_name: read_value(child, reader, config) for child in node.m_Children},
                     )
                     for _ in range(size)
                 ]
+            elif extra_keys:
+                value = [None] * size
+                for i in range(size):
+                    value_i_d = {child._clean_name: read_value(child, reader, config) for child in node.m_Children}
+                    value_i = clz(**{key: value for key, value in value_i_d.items() if key in annotation_keys})
+                    for key in extra_keys:
+                        setattr(value_i, key, value_i_d[key])
+                    value[i] = value_i
             else:
-                clz = getattr(
-                    classes,
-                    node.m_Type,
-                    Object,
-                )
-                clean_names = [clean_name(child.m_Name) for child in node.m_Children]
-                if all(name in clz.__annotations__ for name in clean_names):
-                    value = [
-                        clz(
-                            **{
-                                name: read_value(child, reader, as_dict, assetsfile)
-                                for name, child in zip(clean_names, node.m_Children)
-                            }
-                        )
-                        for _ in range(size)
-                    ]
-                else:
-                    extra_keys = set(clean_names) - set(clz.__annotations__)
-                    value = [None] * size
-                    for i in range(size):
-                        value_i_d = {
-                            clean_name(child.m_Name): read_value(
-                                child, reader, as_dict, assetsfile
-                            )
-                            for child in node.m_Children
-                        }
-                        value_i = clz(
-                            **{
-                                key: value
-                                for key, value in value_i_d.items()
-                                if key in clz.__annotations__
-                            }
-                        )
-                        for key in extra_keys:
-                            setattr(value_i, key, value_i_d[key])
-                        value[i] = value_i
+                value = [
+                    clz(**{child._clean_name: read_value(child, reader, config) for child in node.m_Children})
+                    for _ in range(size)
+                ]
+
     if align:
         reader.align_stream()
     return value
@@ -353,9 +405,10 @@ FUNCTION_WRITE_MAP = {
 
 
 def write_value(
-    value: Any,
+    value: Union[dict[str, Any], Object],
     node: TypeTreeNode,
     writer: EndianBinaryWriter,
+    config: TypeTreeConfig,
 ) -> None:
     # print(reader.Position, node.m_Name, node.m_Type, node.m_MetaFlag)
     align = metaflag_is_aligned(node.m_MetaFlag)
@@ -364,23 +417,42 @@ def write_value(
     if func:
         value = func(writer, value)
     elif node.m_Type == "pair":
-        write_value(value[0], node.m_Children[0], writer)
-        write_value(value[1], node.m_Children[1], writer)
+        write_value(value[0], node.m_Children[0], writer, config)
+        write_value(value[1], node.m_Children[1], writer, config)
+    elif node.m_Type == "ReferencedObject":
+        for child in node.m_Children:
+            if child.m_Type == "ReferencedObjectData":
+                ref_type_nodes = get_ref_type_node(value, config.assetsfile)
+                write_value(value[child.m_Name], ref_type_nodes, writer, config)
+            else:
+                write_value(value[child.m_Name], child, writer, config)
     elif node.m_Children and node.m_Children[0].m_Type == "Array":
         if metaflag_is_aligned(node.m_Children[0].m_MetaFlag):
             align = True
 
         writer.write_int(len(value))
         subtype = node.m_Children[0].m_Children[1]
-        [write_value(sub_value, subtype, writer) for sub_value in value]
+        [write_value(sub_value, subtype, writer, config) for sub_value in value]
 
     else:  # Class
         if isinstance(value, dict):
             for child in node.m_Children:
-                write_value(value[child.m_Name], child, writer)
+                if child.m_Type == "ManagedReferencesRegistry":
+                    if config.has_registry:
+                        continue
+                    else:
+                        config = config.copy()
+                        config.has_registry = True
+                write_value(value[child.m_Name], child, writer, config)
         else:
             for child in node.m_Children:
-                write_value(getattr(value, clean_name(child.m_Name)), child, writer)
+                if child.m_Type == "ManagedReferencesRegistry":
+                    if config.has_registry:
+                        continue
+                    else:
+                        config = config.copy()
+                        config.has_registry = True
+                write_value(getattr(value, child._clean_name), child, writer, config)
 
     if align:
         writer.align_stream()

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Union, cast
 
 from PIL import Image, ImageDraw
+from PIL.Image import Transform, Transpose
 
+from ..classes import SpriteAtlasData
 from ..enums import (
     ClassIDType,
     SpriteMeshType,
@@ -17,6 +19,11 @@ if TYPE_CHECKING:
     from typing import List, Optional, Tuple
 
     from ..classes import PPtr, Sprite, Texture2D
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 
 class SpriteSettings:
@@ -34,24 +41,22 @@ class SpriteSettings:
         # rest of the bits are reserved
 
 
-def get_image(
-    sprite: Sprite, texture: PPtr[Texture2D], alpha_texture: Optional[PPtr[Texture2D]]
-) -> Image.Image:
+def get_image(sprite: Sprite, texture: PPtr[Texture2D], alpha_texture: Optional[PPtr[Texture2D]]) -> Image.Image:
+    assert sprite.assets_file, "Sprite assets file is not set!"
+    cache = cast(Dict[Any, Any], sprite.assets_file._cache)  # TODO: edit in SerializibleFile
     if alpha_texture:
         cache_id = (texture.path_id, alpha_texture.path_id)
-        if cache_id not in sprite.assets_file._cache:
+        if cache_id not in cache:
             original_image = get_image_from_texture2d(texture.read(), False)
             alpha_image = get_image_from_texture2d(alpha_texture.read(), False)
-            original_image = Image.merge(
-                "RGBA", (*original_image.split()[:3], alpha_image.split()[0])
-            )
-            sprite.assets_file._cache[cache_id] = original_image
+            original_image = Image.merge("RGBA", (*original_image.split()[:3], alpha_image.split()[0]))
+            cache[cache_id] = original_image
     else:
         cache_id = texture.path_id
-        if cache_id not in sprite.assets_file._cache:
+        if cache_id not in cache:
             original_image = get_image_from_texture2d(texture.read(), False)
-            sprite.assets_file._cache[cache_id] = original_image
-    return sprite.assets_file._cache[cache_id]
+            cache[cache_id] = original_image
+    return cache[cache_id]
 
 
 def get_image_from_sprite(m_Sprite: Sprite) -> Image.Image:
@@ -60,6 +65,7 @@ def get_image_from_sprite(m_Sprite: Sprite) -> Image.Image:
         atlas = m_Sprite.m_SpriteAtlas.read()
     elif m_Sprite.m_AtlasTags:
         # looks like the direct pointer is empty, let's try to find the Atlas via its name
+        assert m_Sprite.assets_file, "Sprite assets file is not set!"
         for obj in m_Sprite.assets_file.objects.values():
             if obj.type == ClassIDType.SpriteAtlas:
                 atlas = obj.read()
@@ -68,11 +74,8 @@ def get_image_from_sprite(m_Sprite: Sprite) -> Image.Image:
                 atlas = None
 
     if atlas:
-        sprite_atlas_data = next(
-            value
-            for key, value in atlas.m_RenderDataMap
-            if key == m_Sprite.m_RenderDataKey
-        )
+        sprite_atlas_data = next(value for key, value in atlas.m_RenderDataMap if key == m_Sprite.m_RenderDataKey)
+        assert isinstance(sprite_atlas_data, SpriteAtlasData), "SpriteAtlasData not found!"
     else:
         sprite_atlas_data = m_Sprite.m_RD
 
@@ -96,35 +99,34 @@ def get_image_from_sprite(m_Sprite: Sprite) -> Image.Image:
     if settings_raw.packed == 1:
         rotation = settings_raw.packingRotation
         if rotation == SpritePackingRotation.kSPRFlipHorizontal:
-            sprite_image = sprite_image.transpose(Image.FLIP_LEFT_RIGHT)
+            sprite_image = sprite_image.transpose(Transpose.FLIP_LEFT_RIGHT)
         # spriteImage = RotateFlip(RotateFlipType.RotateNoneFlipX)
         elif rotation == SpritePackingRotation.kSPRFlipVertical:
-            sprite_image = sprite_image.transpose(Image.FLIP_TOP_BOTTOM)
+            sprite_image = sprite_image.transpose(Transpose.FLIP_TOP_BOTTOM)
         # spriteImage.RotateFlip(RotateFlipType.RotateNoneFlipY)
         elif rotation == SpritePackingRotation.kSPRRotate180:
-            sprite_image = sprite_image.transpose(Image.ROTATE_180)
+            sprite_image = sprite_image.transpose(Transpose.ROTATE_180)
         # spriteImage.RotateFlip(RotateFlipType.Rotate180FlipNone)
         elif rotation == SpritePackingRotation.kSPRRotate90:
-            sprite_image = sprite_image.transpose(Image.ROTATE_270)
+            sprite_image = sprite_image.transpose(Transpose.ROTATE_270)
         # spriteImage.RotateFlip(RotateFlipType.Rotate270FlipNone)
 
     if settings_raw.packingMode == SpritePackingMode.kSPMTight:
+        assert m_Sprite.object_reader, "Sprite object reader is not set!"
         mesh = MeshHandler(m_Sprite.m_RD, m_Sprite.object_reader.version)
         mesh.process()
 
-        if any(u or v for u, v in mesh.m_UV0):
+        if mesh.m_UV0 and any(u or v for u, v in mesh.m_UV0):
             # copy triangles from mesh
             sprite_image = render_sprite_mesh(m_Sprite, mesh, original_image)
         else:
             # create mask to keep only the polygon
             sprite_image = mask_sprite(m_Sprite, mesh, sprite_image)
 
-    return sprite_image.transpose(Image.FLIP_TOP_BOTTOM)
+    return sprite_image.transpose(Transpose.FLIP_TOP_BOTTOM)
 
 
-def mask_sprite(
-    m_Sprite: Sprite, mesh: MeshHandler, sprite_image: Image.Image
-) -> Image.Image:
+def mask_sprite(m_Sprite: Sprite, mesh: MeshHandler, sprite_image: Image.Image) -> Image.Image:
     mask_img = Image.new("1", sprite_image.size, color=0)
     draw = ImageDraw.ImageDraw(mask_img)
 
@@ -132,12 +134,13 @@ def mask_sprite(
     #  shift the whole point matrix into the positive space
     #  multiply them with a factor to scale them to the image
     positions = mesh.m_Vertices
+    assert positions, "No vertices found in sprite mesh!"
+    # find the axis that has only one value - can be removed
+    # usually the z axis
     min_x = min(x for x, _y, _z in positions)
     min_y = min(y for _x, y, _z in positions)
     factor = m_Sprite.m_PixelsToUnits
-    positions_2d = [
-        ((x - min_x) * factor, (y - min_y) * factor) for x, y, _z in positions
-    ]
+    positions_2d = [((x - min_x) * factor, (y - min_y) * factor) for x, y, _z in positions]
 
     # generate triangles from the given points
     triangles = [
@@ -166,12 +169,14 @@ def mask_sprite(
     return sprite_image
 
 
-def render_sprite_mesh(
-    m_Sprite: Sprite, mesh: MeshHandler, texture: Image.Image
-) -> Image.Image:
+def render_sprite_mesh(m_Sprite: Sprite, mesh: MeshHandler, texture: Image.Image) -> Image.Image:
     for triangles in mesh.get_triangles():
         positions = mesh.m_Vertices
+        if not positions:
+            continue
         uv = mesh.m_UV0
+        if not uv:
+            raise ValueError("No UV coordinates found in sprite mesh!")
 
         # 2. patch position data
         # 2.1 make positions 2d
@@ -193,8 +198,7 @@ def render_sprite_mesh(
         # 2.3 convert relative positions to absolute
         pixels_to_units = m_Sprite.m_PixelsToUnits
         positions_abs = [
-            (round((x - x_min) * pixels_to_units), round((y - y_min) * pixels_to_units))
-            for x, y in zip(*axis_values)
+            (round((x - x_min) * pixels_to_units), round((y - y_min) * pixels_to_units)) for x, y in zip(*axis_values)
         ]
         width, height = texture.size
         uv_abs = [(round(u * width), round(v * height)) for u, v in uv]
@@ -209,19 +213,21 @@ def render_sprite_mesh(
         for tri in triangles:
             copy_triangle(
                 texture,
-                [uv_abs[i] for i in tri],
+                tuple(uv_abs[i] for i in tri),  # type: ignore
                 sprite,
-                [positions_abs[i] for i in tri],
+                tuple(positions_abs[i] for i in tri),  # type: ignore
             )
 
         return sprite
+    else:
+        raise ValueError("No triangles found in mesh!")
 
 
 def copy_triangle(
     src_img: Image.Image,
-    src_tri: Tuple[float, float],
+    src_tri: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
     dst_img: Image.Image,
-    dst_tri: Tuple[float, float],
+    dst_tri: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
 ) -> None:
     src_off = (
         (src_tri[1][0] - src_tri[0][0], src_tri[1][1] - src_tri[0][1]),
@@ -237,7 +243,15 @@ def copy_triangle(
         # no transform necessary, just copy the triangle
 
         # make rectangle that contains the triangle
-        upper_left, _, lower_right = sorted(src_tri)
+        # upper_left, _, lower_right = sorted(src_tri)
+        upper_left = (
+            min(src_tri[0][0], src_tri[1][0], src_tri[2][0]),
+            min(src_tri[0][1], src_tri[1][1], src_tri[2][1]),
+        )
+        lower_right = (
+            max(src_tri[0][0], src_tri[1][0], src_tri[2][0]),
+            max(src_tri[0][1], src_tri[1][1], src_tri[2][1]),
+        )
         src_part = src_img.crop((*upper_left, *lower_right))
 
         # create mask for triangle
@@ -247,7 +261,11 @@ def copy_triangle(
         maskdraw.polygon(mask_box, fill=255)
 
         # paste triangle into destination image
-        dst_img.paste(src_part, min(dst_tri))
+        dst = (
+            int(min(dst_tri[0][0], dst_tri[1][0], dst_tri[2][0])),
+            int(min(dst_tri[0][1], dst_tri[1][1], dst_tri[2][1])),
+        )
+        dst_img.paste(src_part, dst, mask=mask)
     else:
         # transform is necessary, use affine transformation
         # https://stackoverflow.com/a/6959111
@@ -267,10 +285,13 @@ def copy_triangle(
         # Vector y corresponds to the x coordinates in the source triangle
         y = [x11, x21, x31, x12, x22, x32]
 
-        # np.lingal.solve - obviously way faster, but numpy will only come with 2.0
-        A = linalg_solve(M, y)
+        if np:
+            A = np.linalg.solve(M, y)
+        else:
+            # np.lingal.solve - obviously way faster, but numpy will only come with 2.0
+            A = linalg_solve(M, y)  # type: ignore
 
-        transformed = src_img.transform(dst_img.size, Image.AFFINE, A)
+        transformed = src_img.transform(dst_img.size, Transform.AFFINE, A)
 
         mask = Image.new("1", dst_img.size)
         maskdraw = ImageDraw.Draw(mask)
@@ -279,18 +300,18 @@ def copy_triangle(
         dst_img.paste(transformed, mask=mask)
 
 
-def linalg_solve(M: List[List[float]], y: List[float]) -> List[float]:
+def linalg_solve(M: List[List[Union[float, int]]], y: List[Union[float, int]]) -> List[float]:
     # M^-1 * y
     M_i = get_matrix_inverse(M)
     return [sum(M_i[i][j] * y[j] for j in range(len(y))) for i in range(len(M_i))]
 
 
-def transpose_matrix(m: List[List[float]]) -> List[List[float]]:
+def transpose_matrix(m: List[List[float]]) -> Iterable[List[float]]:
     # https://stackoverflow.com/a/39881366
     return map(list, zip(*m))
 
 
-def get_matrix_minor(m: List[List[float]], i: int, j: int) -> List[float]:
+def get_matrix_minor(m: List[List[float]], i: int, j: int) -> List[List[float]]:
     # https://stackoverflow.com/a/39881366
     return [row[:j] + row[j + 1 :] for row in (m[:i] + m[i + 1 :])]
 
@@ -301,10 +322,7 @@ def get_matrix_determinant(m: List[List[float]]) -> float:
     if len(m) == 2:
         return m[0][0] * m[1][1] - m[0][1] * m[1][0]
 
-    return sum(
-        ((-1) ** c) * m[0][c] * get_matrix_determinant(get_matrix_minor(m, 0, c))
-        for c in range(len(m))
-    )
+    return sum(((-1) ** c) * m[0][c] * get_matrix_determinant(get_matrix_minor(m, 0, c)) for c in range(len(m)))
 
 
 def get_matrix_inverse(m: List[List[float]]) -> List[List[float]]:
@@ -319,10 +337,7 @@ def get_matrix_inverse(m: List[List[float]]) -> List[List[float]]:
 
     # find matrix of cofactors
     cofactors = [
-        [
-            ((-1) ** (r + c)) * get_matrix_determinant(get_matrix_minor(m, r, c))
-            for c in range(len(m))
-        ]
+        [((-1) ** (r + c)) * get_matrix_determinant(get_matrix_minor(m, r, c)) for c in range(len(m))]
         for r in range(len(m))
     ]
     cofactors = list(transpose_matrix(cofactors))

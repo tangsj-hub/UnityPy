@@ -4,12 +4,16 @@ from enum import IntEnum, IntFlag
 from importlib.resources import open_binary
 from io import BytesIO
 from struct import Struct
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypeVar
 
 from .TypeTreeHelper import TypeTreeNode
+from .UnityVersion import UnityVersion
 
-TPKTYPETREE: TpkTypeTreeBlob = None
-NODES_CACHE: dict = {}
+T = TypeVar("T")
+
+TPKTYPETREE: TpkTypeTreeBlob = None  # pyright: ignore[reportAssignmentType]
+CLASSES_CACHE: Dict[Tuple[int, UnityVersion], TypeTreeNode] = {}
+NODES_CACHE: Dict[TpkUnityClass, TypeTreeNode] = {}
 
 
 def init():
@@ -18,27 +22,35 @@ def init():
 
     global TPKTYPETREE
     with BytesIO(data) as stream:
-        TPKTYPETREE = TpkFile(stream).GetDataBlob()
+        blob = TpkFile(stream).GetDataBlob()
+        assert isinstance(blob, TpkTypeTreeBlob)
+        TPKTYPETREE = blob
 
 
-def get_typetree_node(class_id: int, version: tuple):
-    global NODES_CACHE
+def get_typetree_node(class_id: int, version: UnityVersion):
+    global CLASSES_CACHE
     key = (class_id, version)
-    if key in NODES_CACHE:
-        return NODES_CACHE[key]
+    cached = CLASSES_CACHE.get(key)
+    if cached:
+        return cached
 
-    class_info = TPKTYPETREE.ClassInformation[class_id].getVersionedClass(
-        UnityVersion.fromList(*version)
-    )
+    class_info = TPKTYPETREE.ClassInformation[class_id].getVersionedClass(version)
     if class_info is None:
         raise ValueError("Could not find class info for class id {}".format(class_id))
 
     node = generate_node(class_info)
-    NODES_CACHE[key] = node
+    CLASSES_CACHE[key] = node
     return node
 
 
 def generate_node(class_info: TpkUnityClass) -> TypeTreeNode:
+    global NODES_CACHE
+    cached = NODES_CACHE.get(class_info)
+    if cached:
+        return cached
+
+    assert class_info.ReleaseRootNode is not None, "Class {} has no ReleaseRootNode".format(class_info)
+
     nodes = []
     NODES = TPKTYPETREE.NodeBuffer.Nodes
     stack = [(class_info.ReleaseRootNode, 0)]
@@ -59,7 +71,9 @@ def generate_node(class_info: TpkUnityClass) -> TypeTreeNode:
         )
         stack = [(node_id, level + 1) for node_id in node.SubNodes] + stack
         index += 1
-    return TypeTreeNode.from_list(nodes)
+    result = TypeTreeNode.from_list(nodes)
+    NODES_CACHE[class_info] = result
+    return result
 
 
 ######################################################################################
@@ -74,15 +88,6 @@ class TpkCompressionType(IntEnum):
     Lz4 = 1
     Lzma = 2
     Brotli = 3
-
-
-class UnityVersionType(IntEnum):
-    Alpha = 0
-    Beta = 1
-    China = 2
-    Final = 3
-    Patch = 4
-    Experimental = 5
 
 
 class TpkDataType(IntEnum):
@@ -157,16 +162,14 @@ class TpkFile:
             raise Exception("Invalid compressed size")
 
     def GetDataBlob(self) -> TpkDataBlob:
-        decompressed = None
+        decompressed: bytes
         if self.CompressionType == TpkCompressionType.NONE:
             decompressed = self.CompressedBytes
 
         elif self.CompressionType == TpkCompressionType.Lz4:
             import lz4.block
 
-            decompressed = lz4.block.decompress(
-                self.CompressedBytes, self.UncompressedSize
-            )
+            decompressed = lz4.block.decompress(self.CompressedBytes, self.UncompressedSize)
 
         elif self.CompressionType == TpkCompressionType.Lzma:
             import lzma
@@ -176,7 +179,7 @@ class TpkFile:
         elif self.CompressionType == TpkCompressionType.Brotli:
             import brotli
 
-            decompressed: bytes = brotli.decompress(self.CompressedBytes)
+            decompressed = brotli.decompress(self.CompressedBytes)
 
         else:
             raise Exception("Invalid compression type")
@@ -219,11 +222,9 @@ class TpkTypeTreeBlob(TpkDataBlob):
     def __init__(self, stream: BytesIO) -> None:
         (self.CreationTime,) = INT64.unpack(stream.read(INT64.size))
         (versionCount,) = INT32.unpack(stream.read(INT32.size))
-        self.Versions = [UnityVersion.fromStream(stream) for _ in range(versionCount)]
+        self.Versions = [read_version(stream) for _ in range(versionCount)]
         (classCount,) = INT32.unpack(stream.read(INT32.size))
-        self.ClassInformation = {
-            x.ID: x for x in (TpkClassInformation(stream) for _ in range(classCount))
-        }
+        self.ClassInformation = {x.ID: x for x in (TpkClassInformation(stream) for _ in range(classCount))}
         self.CommonString = TpkCommonString(stream)
         self.NodeBuffer = TpkUnityNodeBuffer(stream)
         self.StringBuffer = TpkStringBuffer(stream)
@@ -275,67 +276,17 @@ class TpkJsonBlob(TpkDataBlob):
 ######################################################################################
 
 
-class UnityVersion(int):
-    # https://github.com/AssetRipper/VersionUtilities/blob/master/VersionUtilities/UnityVersion.cs
-    """
-    use following static methos instead of the constructor(__init__):
-        UnityVersion.fromStream(stream: BytesIO)
-        UnityVersion.fromString(version: str)
-        UnityVersion.fromList(major: int, minor: int, patch: int, build: int)
-    """
-
-    @staticmethod
-    def fromStream(stream: BytesIO) -> UnityVersion:
-        (m_data,) = UINT64.unpack(stream.read(UINT64.size))
-        return UnityVersion(m_data)
-
-    @staticmethod
-    def fromString(version: str) -> UnityVersion:
-        return UnityVersion(version.split("."))
-
-    @staticmethod
-    def fromList(
-        major: int = 0, minor: int = 0, patch: int = 0, build: int = 0
-    ) -> UnityVersion:
-        return UnityVersion(major << 48 | minor << 32 | patch << 16 | build)
-
-    @property
-    def major(self) -> int:
-        return (self >> 48) & 0xFFFF
-
-    @property
-    def minor(self) -> int:
-        return (self >> 32) & 0xFFFF
-
-    @property
-    def build(self) -> int:
-        return (self >> 16) & 0xFFFF
-
-    @property
-    def type(self) -> int:
-        return UnityVersionType(self >> 8) & 0xFF
-
-    @property
-    def type_number(self) -> int:
-        return self & 0xFF
-
-    def __repr__(self) -> str:
-        return f"UnityVersion {self.major}.{self.minor}.{self.build}.{self.type_number}"
-
-
 class TpkUnityClass:
     __slots__ = ("Name", "Base", "Flags", "EditorRootNode", "ReleaseRootNode")
     Struct = Struct("<HHb")
     Name: int
     Base: int
     Flags: TpkUnityClassFlags
-    EditorRootNode: int
-    ReleaseRootNode: int
+    EditorRootNode: Optional[int]
+    ReleaseRootNode: Optional[int]
 
     def __init__(self, stream: BytesIO) -> None:
-        self.Name, self.Base, Flags = TpkUnityClass.Struct.unpack(
-            stream.read(TpkUnityClass.Struct.size)
-        )
+        self.Name, self.Base, Flags = TpkUnityClass.Struct.unpack(stream.read(TpkUnityClass.Struct.size))
         self.Flags = TpkUnityClassFlags(Flags)
         self.EditorRootNode = self.ReleaseRootNode = None
         if self.Flags & TpkUnityClassFlags.HasEditorRootNode:
@@ -343,32 +294,48 @@ class TpkUnityClass:
         if self.Flags & TpkUnityClassFlags.HasReleaseRootNode:
             (self.ReleaseRootNode,) = UINT16.unpack(stream.read(UINT16.size))
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "Name": self.Name,
+            "Base": self.Base,
+            "Flags": self.Flags,
+            "EditorRootNode": self.EditorRootNode,
+            "ReleaseRootNode": self.ReleaseRootNode,
+        }
+
     def __eq__(self, other: TpkUnityClass) -> bool:
-        return self.__dict__ == other.__dict__
+        return self.to_dict() == other.to_dict()
 
     def __hash__(self) -> int:
-        # TODO
-        return hash(self.__dict__)
+        return hash(
+            (
+                self.Name,
+                self.Base,
+                self.Flags,
+                self.EditorRootNode,
+                self.ReleaseRootNode,
+            )
+        )
 
 
 class TpkClassInformation:
     __slots__ = ("ID", "Classes")
     ID: int
     # TODO - might want to use dict
-    Classes: List[Tuple[UnityVersion, TpkUnityClass]]
+    Classes: List[Tuple[UnityVersion, Optional[TpkUnityClass]]]
 
     def __init__(self, stream: BytesIO) -> None:
         (self.ID,) = INT32.unpack(stream.read(INT32.size))
         (count,) = INT32.unpack(stream.read(INT32.size))
         self.Classes = [
             (
-                UnityVersion.fromStream(stream),
+                read_version(stream),
                 TpkUnityClass(stream) if stream.read(1)[0] else None,
             )
             for _ in range(count)
         ]
 
-    def getVersionedClass(self, version: UnityVersion) -> TpkUnityClass:
+    def getVersionedClass(self, version: UnityVersion) -> Optional[TpkUnityClass]:
         return get_item_for_version(version, self.Classes)
 
 
@@ -436,9 +403,7 @@ class TpkStringBuffer:
     Strings: List[str]
 
     def __init__(self, stream: BytesIO) -> None:
-        self.Strings = [
-            read_string(stream) for _ in range(INT32.unpack(stream.read(INT32.size))[0])
-        ]
+        self.Strings = [read_string(stream) for _ in range(INT32.unpack(stream.read(INT32.size))[0])]
 
     @property
     def Count(self) -> int:
@@ -448,14 +413,11 @@ class TpkStringBuffer:
 class TpkCommonString:
     __slots__ = ("VersionInformation", "StringBufferIndices")
     VersionInformation: List[Tuple[UnityVersion, int]]
-    StringBufferIndices: List[int]
+    StringBufferIndices: Tuple[int, ...]
 
     def __init__(self, stream: BytesIO) -> None:
         (versionCount,) = INT32.unpack(stream.read(INT32.size))
-        self.VersionInformation = [
-            (UnityVersion.fromStream(stream), stream.read(1)[0])
-            for _ in range(versionCount)
-        ]
+        self.VersionInformation = [(read_version(stream), stream.read(1)[0]) for _ in range(versionCount)]
         (indicesCount,) = INT32.unpack(stream.read(INT32.size))
         indicesStruct = Struct(f"<{indicesCount}H")
         self.StringBufferIndices = indicesStruct.unpack(stream.read(indicesStruct.size))
@@ -498,9 +460,11 @@ def read_data(stream: BytesIO) -> bytes:
     return stream.read(INT32.unpack(stream.read(INT32.size))[0])
 
 
-def get_item_for_version(
-    exactVersion: UnityVersion, items: List[Tuple[UnityVersion, Any]]
-) -> Any:
+def read_version(stream: BytesIO) -> UnityVersion:
+    return UnityVersion(UINT64.unpack(stream.read(UINT64.size))[0])
+
+
+def get_item_for_version(exactVersion: UnityVersion, items: List[Tuple[UnityVersion, T]]) -> T:
     ret = None
     for version, item in items:
         if exactVersion >= version:

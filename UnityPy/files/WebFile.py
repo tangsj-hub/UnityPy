@@ -1,6 +1,8 @@
-﻿from . import File
+from typing import Optional
+
 from ..helpers import CompressionHelper
 from ..streams import EndianBinaryReader, EndianBinaryWriter
+from . import File
 
 
 class WebFile(File.File):
@@ -36,8 +38,8 @@ class WebFile(File.File):
 
         # signature check
         signature = reader.read_string_to_null()
-        if signature != "UnityWebData1.0":
-            return
+        if not signature.startswith(("UnityWebData", "TuanjieWebData")):
+            raise ValueError(f"Invalid WebFile signature: {signature!r}. Expected 'UnityWebData' or 'TuanjieWebData'.")
         self.signature = signature
 
         # read header -> contains file headers
@@ -55,7 +57,7 @@ class WebFile(File.File):
 
     def save(
         self,
-        files: dict = None,
+        files: Optional[dict] = None,
         packer: str = "none",
         signature: str = "UnityWebData1.0",
     ) -> bytes:
@@ -66,10 +68,7 @@ class WebFile(File.File):
             packer = self.packer
 
         # get raw data
-        files = {
-            name: f.bytes if isinstance(f, EndianBinaryReader) else f.save()
-            for name, f in files.items()
-        }
+        files = {name: f.bytes if isinstance(f, EndianBinaryReader) else f.save() for name, f in files.items()}
 
         # create writer
         writer = EndianBinaryWriter(endian="<")
@@ -80,9 +79,7 @@ class WebFile(File.File):
         offset = sum(
             [
                 writer.Position,  # signature
-                sum(
-                    len(path.encode("utf-8")) for path in files.keys()
-                ),  # path of each file
+                sum(len(path.encode("utf-8")) for path in files.keys()),  # path of each file
                 4 * 3 * len(files),  # 3 ints per file
                 4,  # offset int
             ]

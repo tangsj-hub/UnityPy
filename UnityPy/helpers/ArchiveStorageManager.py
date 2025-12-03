@@ -1,20 +1,23 @@
 # based on: https://github.com/Razmoth/PGRStudio/blob/master/AssetStudio/PGR/PGR.cs
 import re
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 from ..streams import EndianBinaryReader
 
+try:
+    from UnityPy import UnityPyBoost
+except ImportError:
+    UnityPyBoost = None
+
 UNITY3D_SIGNATURE = b"#$unity3dchina!@"
-DECRYPT_KEY: bytes = None
+DECRYPT_KEY: Optional[bytes] = None
 
 
 def set_assetbundle_decrypt_key(key: Union[bytes, str]):
     if isinstance(key, str):
         key = key.encode("utf-8", "surrogateescape")
     if len(key) != 16:
-        raise ValueError(
-            f"AssetBundle Key length is wrong. It should be 16 bytes and now is {len(key)} bytes."
-        )
+        raise ValueError(f"AssetBundle Key length is wrong. It should be 16 bytes and now is {len(key)} bytes.")
     global DECRYPT_KEY
     DECRYPT_KEY = key
 
@@ -56,20 +59,12 @@ def brute_force_key(
     return None
 
 
-def to_uint4_array(source: bytes, offset: int = 0):
-    buffer = bytearray(len(source) * 2)
-    for j in range(len(source)):
-        buffer[j * 2] = source[offset + j] >> 4
-        buffer[j * 2 + 1] = source[offset + j] & 15
-    return buffer
-
-
 class ArchiveStorageDecryptor:
     unknown_1: int
     index: bytes
     substitute: bytes = bytes(0x10)
 
-    def __init__(self, reader: EndianBinaryReader) -> None:
+    def __init__(self, reader: EndianBinaryReader):
         self.unknown_1 = reader.read_u_int()
 
         # read vector data/key vectors
@@ -82,7 +77,7 @@ class ArchiveStorageDecryptor:
                     [
                         "The BundleFile is encrypted, but no key was provided!",
                         "You can set the key via UnityPy.set_assetbundle_decrypt_key(key).",
-                        "To try brute-forcing the key, use UnityPy.helpers.ArchiveStorageManager.brute_force_key(fp, key_sig, data_sig)",
+                        "To try brute-forcing the key, use UnityPy.helpers.ArchiveStorageManager.brute_force_key(fp, key_sig, data_sig)",  # noqa: E501
                         f"with  key_sig = {self.key_sig}, data_sig = {self.data_sig},"
                         "and fp being the path to global-metadata.dat or a memory dump.",
                     ]
@@ -94,13 +89,14 @@ class ArchiveStorageDecryptor:
             raise Exception(f"Invalid signature {signature} != {UNITY3D_SIGNATURE}")
 
         data = decrypt_key(self.key, self.data, DECRYPT_KEY)
-        data = to_uint4_array(data)
+        data = bytes(nibble for byte in data for nibble in (byte >> 4, byte & 0xF))
         self.index = data[:0x10]
-        self.substitute = bytes(
-            data[0x10 + i * 4 + j] for j in range(4) for i in range(4)
-        )
+        self.substitute = bytes(data[0x10 + i * 4 + j] for j in range(4) for i in range(4))
 
     def decrypt_block(self, data: bytes, index: int):
+        if UnityPyBoost:
+            return UnityPyBoost.decrypt_block(self.index, self.substitute, data, index)
+
         offset = 0
         size = len(data)
         data = bytearray(data)
@@ -110,21 +106,18 @@ class ArchiveStorageDecryptor:
             index += 1
         return data
 
-    def decrypt_byte(self, view: bytearray, offset: int, index: int):
+    def decrypt_byte(self, view: Union[bytearray, memoryview], offset: int, index: int):
         b = (
             self.substitute[((index >> 2) & 3) + 4]
             + self.substitute[index & 3]
             + self.substitute[((index >> 4) & 3) + 8]
             + self.substitute[(index % 256 >> 6) + 12]
         )
-        view[offset] = (
-            (self.index[view[offset] & 0xF] - b) & 0xF
-            | 0x10 * (self.index[view[offset] >> 4] - b)
-        ) % 256
+        view[offset] = ((self.index[view[offset] & 0xF] - b) & 0xF | 0x10 * (self.index[view[offset] >> 4] - b)) % 256
         b = view[offset]
         return b, offset + 1, index + 1
 
-    def decrypt(self, data: bytearray, index: int, remaining: int):
+    def decrypt(self, data: Union[bytearray, memoryview], index: int, remaining: int):
         offset = 0
 
         curByte, offset, index = self.decrypt_byte(data, offset, index)
@@ -148,3 +141,6 @@ class ArchiveStorageDecryptor:
                     b, offset, index = self.decrypt_byte(data, offset, index)
 
         return offset
+
+    # def encrypt(self, data: bytes):
+    #     # TODO: patch BundleFile encryption flag to keep either 0x1000 or 0x400

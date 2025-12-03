@@ -1,28 +1,29 @@
 from __future__ import annotations
+
 import math
 import struct
-from typing import Optional, List, Tuple, Union, TypeVar
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union, cast
 
-from ..enums.MeshTopology import MeshTopology
 from ..classes.generated import (
     ChannelInfo,
-    StreamInfo,
     Mesh,
     SpriteRenderData,
+    StreamInfo,
     Vector2f,
     Vector3f,
     Vector4f,
 )
-from .PackedBitVector import unpack_floats, unpack_ints
-
+from ..enums.MeshTopology import MeshTopology
 from ..enums.VertexFormat import (
-    VertexChannelFormat,
-    VertexFormat2017,
-    VertexFormat,
     VERTEX_CHANNEL_FORMAT_STRUCT_TYPE_MAP,
     VERTEX_FORMAT_2017_STRUCT_TYPE_MAP,
     VERTEX_FORMAT_STRUCT_TYPE_MAP,
+    VertexChannelFormat,
+    VertexFormat,
+    VertexFormat2017,
 )
+from .PackedBitVector import unpack_floats, unpack_ints
+from .ResourceReader import get_resource_data
 
 try:
     from UnityPy import UnityPyBoost
@@ -33,32 +34,30 @@ Tuple2f = Tuple[float, float]
 Tuple3f = Tuple[float, float, float]
 Tuple4f = Tuple[float, float, float, float]
 
-T = TypeVar("T")
 
-
-def flat_list_to_tuples(data: List[T], item_size: int) -> List[tuple[T]]:
-    return [tuple(data[i : i + item_size]) for i in range(0, len(data), item_size)]
-
-
-def vector_list_to_tuples(data: List[Vector2f, Vector3f, Vector4f]) -> List[tuple]:
+def vector_list_to_tuples(
+    data: Union[List[Vector2f], List[Vector3f], List[Vector4f]],
+) -> List[tuple]:
     if isinstance(data[0], Vector2f):
         return [(v.x, v.y) for v in data]
     elif isinstance(data[0], Vector3f):
+        if TYPE_CHECKING:
+            data = cast(List[Vector3f], data)
         return [(v.x, v.y, v.z) for v in data]
     elif isinstance(data[0], Vector4f):
+        if TYPE_CHECKING:
+            data = cast(List[Vector4f], data)
         return [(v.x, v.y, v.z, v.w) for v in data]
     else:
         raise ValueError("Unknown vector type")
 
 
-def zeros(shape: Tuple[int, ...]) -> list:
-    if len(shape) == 1:
-        return [0] * shape[0]
-    elif len(shape) == 2:
-        m, n = shape
-        return [[0] * n for _ in range(m)]
-    else:
-        raise ValueError("Invalid shape")
+def lists_to_tuples(data: List[list]) -> List[tuple]:
+    return [tuple(v) for v in data]
+
+
+def zeros(m: int, n: int) -> List[list]:
+    return [[0] * n for _ in range(m)]
 
 
 def normalize(*vector: float) -> Tuple[float, ...]:
@@ -75,7 +74,9 @@ class MeshHandler:
     version: Tuple[int, int, int, int]
     m_VertexCount: int = 0
     m_Vertices: Optional[List[Tuple3f]] = None
-    m_Normals: Optional[List[Tuple3f]] = None
+    # normals can be stored as Tuple4f,
+    # in such cases the 4th dimension is always 0 and can be discarded
+    m_Normals: Optional[Union[List[Tuple3f], List[Tuple4f]]] = None
     m_Colors: Optional[List[Tuple4f]] = None
     m_UV0: Optional[List[Tuple2f]] = None
     m_UV1: Optional[List[Tuple2f]] = None
@@ -85,9 +86,9 @@ class MeshHandler:
     m_UV5: Optional[List[Tuple2f]] = None
     m_UV6: Optional[List[Tuple2f]] = None
     m_UV7: Optional[List[Tuple2f]] = None
-    m_Tangents: Optional[List[float]] = None
-    m_BoneIndices: Optional[List[int]] = None
-    m_BoneWeights: Optional[List[float]] = None
+    m_Tangents: Optional[List[Tuple4f]] = None
+    m_BoneIndices: Optional[List[Tuple[int, int, int, int]]] = None
+    m_BoneWeights: Optional[List[Tuple4f]] = None
     m_IndexBuffer: Optional[List[int]] = None
     m_Use16BitIndices: bool = True
 
@@ -96,12 +97,12 @@ class MeshHandler:
         src: Union[Mesh, SpriteRenderData],
         version: Optional[Tuple[int, int, int, int]] = None,
         endianess: str = "<",
-    ) -> None:
+    ):
         self.src = src
         self.endianess = endianess
         if version is not None:
             self.version = version
-        elif getattr(src, "object_reader", None):
+        elif not isinstance(src, SpriteRenderData) and src.object_reader is not None:
             self.version = src.object_reader.version
         else:
             raise ValueError("No version provided and no object reader found")
@@ -130,9 +131,7 @@ class MeshHandler:
             assert all(stream is not None for stream in m_Streams)
             m_Channels = self.get_channels(m_Streams)
         elif self.version[0] == 4:
-            assert (
-                vertex_data.m_Streams is not None and vertex_data.m_Channels is not None
-            )
+            assert vertex_data.m_Streams is not None and vertex_data.m_Channels is not None
             m_Streams = vertex_data.m_Streams
             m_Channels = vertex_data.m_Channels
         else:
@@ -140,18 +139,33 @@ class MeshHandler:
             m_Channels = vertex_data.m_Channels
             m_Streams = self.get_streams(m_Channels, vertex_data.m_VertexCount)
 
-        stream_data = getattr(mesh, "m_StreamData", None)
-        if stream_data and stream_data.path:
-            vertex_data = self.src.m_VertexData
-            if vertex_data and vertex_data.m_VertexCount > 0:
-                raise NotImplementedError("External data is not yet supported")
-                # resourceReader = new ResourceReader(m_StreamData.path, assetsFile, m_StreamData.offset, m_StreamData.size)
-                # m_VertexData.m_DataSize = resourceReader.GetData()
+        if (
+            isinstance(mesh, Mesh) and mesh.m_StreamData and mesh.m_StreamData.path
+            # and mesh.m_VertexData
+            # and mesh.m_VertexData.m_VertexCount
+        ):
+            stream_data = mesh.m_StreamData
+            assert mesh.object_reader, "No object reader assigned to the input Mesh!"
+            data = get_resource_data(
+                stream_data.path,
+                mesh.object_reader.assets_file,
+                stream_data.offset,
+                stream_data.size,
+            )
+            vertex_data.m_DataSize = data
 
         # try to copy data directly from mesh
         if isinstance(mesh, Mesh):
-            if self.src.m_Use16BitIndices is False:
-                self.m_Use16BitIndices = False
+            if mesh.m_Use16BitIndices is not None:
+                self.m_Use16BitIndices = bool(mesh.m_Use16BitIndices)
+            elif (
+                self.version >= (2017, 4)
+                or
+                # version == (2017, 3, 1) & patched - px string
+                self.version[:2] == (2017, 3)
+                and mesh.m_MeshCompression == 0
+            ):
+                self.m_Use16BitIndices = mesh.m_IndexFormat == 0
             self.copy_from_mesh()
         elif isinstance(mesh, SpriteRenderData):
             self.copy_from_spriterenderdata()
@@ -167,8 +181,9 @@ class MeshHandler:
                 char = "I"
                 index_size = 4
 
-            self.m_IndexBuffer = struct.unpack(
-                f"<{len(raw_indices) // index_size}{char}", raw_indices
+            self.m_IndexBuffer = cast(
+                List[int],
+                struct.unpack(f"<{len(raw_indices) // index_size}{char}", raw_indices),
             )
 
         if self.version >= (3, 5):
@@ -183,6 +198,8 @@ class MeshHandler:
     def copy_from_mesh(self):
         """Copy data from mesh to handler if it's not already set."""
         mesh = self.src
+        if TYPE_CHECKING:
+            assert isinstance(mesh, Mesh)
 
         if self.m_IndexBuffer is None and mesh.m_IndexBuffer:
             self.m_IndexBuffer = mesh.m_IndexBuffer
@@ -203,30 +220,23 @@ class MeshHandler:
             self.m_UV1 = vector_list_to_tuples(mesh.m_UV1)
 
         if self.m_Colors is None and mesh.m_Colors:
-            self.m_Colors = vector_list_to_tuples(mesh.m_Colors)
+            self.m_Colors = [
+                (color.r / 255.0, color.g / 255.0, color.b / 255.0, color.a / 255.0) for color in mesh.m_Colors
+            ]
 
         if self.m_BoneWeights is None and mesh.m_Skin:
             # BoneInfluence == BoneWeight in terms of usage in UnityPy due to int simplification
-            self.m_BoneWeights = zeros((len(mesh.m_Skin), 4))
-            self.m_BoneIndices = zeros((len(mesh.m_Skin), 4))
-            for skin, indices, weights in zip(
-                mesh.m_Skin, self.m_BoneIndices, self.m_BoneWeights
-            ):
-                indices[:] = [
-                    skin.boneIndex_0_,
-                    skin.boneIndex_1_,
-                    skin.boneIndex_2_,
-                    skin.boneIndex_3_,
-                ]
-                weights[:] = [
-                    skin.weight_0_,
-                    skin.weight_1_,
-                    skin.weight_2_,
-                    skin.weight_3_,
-                ]
+            self.m_BoneIndices = [
+                (skin.boneIndex_0_, skin.boneIndex_1_, skin.boneIndex_2_, skin.boneIndex_3_) for skin in mesh.m_Skin
+            ]
+            self.m_BoneWeights = [
+                (skin.weight_0_, skin.weight_1_, skin.weight_2_, skin.weight_3_) for skin in mesh.m_Skin
+            ]
 
     def copy_from_spriterenderdata(self):
         rd = self.src
+        if TYPE_CHECKING:
+            assert isinstance(rd, SpriteRenderData)
 
         if self.m_IndexBuffer is None:
             if rd.m_IndexBuffer:
@@ -235,22 +245,17 @@ class MeshHandler:
                 self.m_IndexBuffer = rd.indices
 
         if self.m_Vertices is None and rd.vertices:
-            vertices = [rd.vertices]
+            vertices = rd.vertices
             self.m_Vertices = [(v.pos.x, v.pos.y, v.pos.z) for v in vertices]
 
             if vertices[0].uv is not None:
-                self.m_UV0 = [(v.uv.x, v.uv.y) for v in vertices]
+                self.m_UV0 = [(v.uv.x, v.uv.y) for v in vertices]  # type: ignore
 
         # if self.m_BindPose is None and rd.m_BindPose:
         #     self.m_BindPose = rd.m_BindPose
 
-    def get_streams(
-        self, m_Channels: list[ChannelInfo], m_VertexCount: int
-    ) -> list[StreamInfo]:
-        streamCount = 1
-        if m_Channels:
-            streamCount += max(x.stream for x in m_Channels)
-
+    def get_streams(self, m_Channels: list[ChannelInfo], m_VertexCount: int) -> list[StreamInfo]:
+        streamCount = 1 + max(x.stream for x in m_Channels)
         m_Streams: list[StreamInfo] = []
         offset = 0
         for s in range(streamCount):
@@ -261,7 +266,7 @@ class MeshHandler:
                     if m_Channel.dimension > 0:
                         chnMask |= 1 << chn
                         component_size = self.get_channel_component_size(m_Channel)
-                        stride += m_Channel.dimension * component_size
+                        stride += (m_Channel.dimension & 0xF) * component_size
 
             m_Streams.append(
                 StreamInfo(
@@ -316,9 +321,7 @@ class MeshHandler:
 
         return m_Channels
 
-    def read_vertex_data(
-        self, m_Channels: list[ChannelInfo], m_Streams: list[StreamInfo]
-    ) -> None:
+    def read_vertex_data(self, m_Channels: list[ChannelInfo], m_Streams: list[StreamInfo]) -> None:
         m_VertexData = self.src.m_VertexData
         if m_VertexData is None:
             return
@@ -353,6 +356,7 @@ class MeshHandler:
                 # channel_byte_size = m_Channel.dimension * component_byte_size
 
                 swap = self.endianess == "<" and component_byte_size > 1
+                channel_dimension = m_Channel.dimension & 0xF
 
                 if UnityPyBoost:
                     componentBytes = UnityPyBoost.unpack_vertexdata(
@@ -362,41 +366,25 @@ class MeshHandler:
                         m_Stream.offset,
                         m_Stream.stride,
                         m_Channel.offset,
-                        m_Channel.dimension,
+                        channel_dimension,
                         swap,
                     )
                 else:
-                    componentBytes = bytearray(
-                        m_VertexCount * m_Channel.dimension * component_byte_size
-                    )
+                    componentBytes = bytearray(m_VertexCount * channel_dimension * component_byte_size)
 
                     vertexBaseOffset = m_Stream.offset + m_Channel.offset
                     for v in range(m_VertexCount):
                         vertexOffset = vertexBaseOffset + m_Stream.stride * v
-                        for d in range(m_Channel.dimension):
+                        for d in range(channel_dimension):
                             componentOffset = vertexOffset + component_byte_size * d
                             vertexDataSrc = componentOffset
-                            componentDataSrc = component_byte_size * (
-                                v * m_Channel.dimension + d
-                            )
-                            buff = m_VertexData.m_DataSize[
-                                vertexDataSrc : vertexDataSrc + component_byte_size
-                            ]
+                            componentDataSrc = component_byte_size * (v * channel_dimension + d)
+                            buff = m_VertexData.m_DataSize[vertexDataSrc : vertexDataSrc + component_byte_size]
                             if swap:  # swap bytes
                                 buff = buff[::-1]
-                            componentBytes[
-                                componentDataSrc : componentDataSrc
-                                + component_byte_size
-                            ] = buff
+                            componentBytes[componentDataSrc : componentDataSrc + component_byte_size] = buff
 
-                count = len(componentBytes) // component_byte_size
-                component_data = struct.unpack(
-                    f">{count}{component_dtype}", componentBytes
-                )
-                component_data = flat_list_to_tuples(
-                    component_data, m_Channel.dimension
-                )
-
+                component_data = list(struct.iter_unpack(f">{channel_dimension}{component_dtype}", componentBytes))
                 self.assign_channel_vertex_data(chn, component_data)
 
     def assign_channel_vertex_data(self, channel: int, component_data: list):
@@ -475,13 +463,12 @@ class MeshHandler:
     def decompress_compressed_mesh(self):
         # TODO: m_Triangles????
 
-        # Vertex
         version = self.version
+        assert isinstance(self.src, Mesh)
         m_CompressedMesh = self.src.m_CompressedMesh
 
-        self.m_VertexCount = m_VertexCount = int(
-            m_CompressedMesh.m_Vertices.m_NumItems / 3
-        )
+        # Vertex
+        self.m_VertexCount = m_VertexCount = m_CompressedMesh.m_Vertices.m_NumItems // 3
 
         if m_CompressedMesh.m_Vertices.m_NumItems > 0:
             self.m_Vertices = unpack_floats(m_CompressedMesh.m_Vertices, shape=(3,))
@@ -511,9 +498,7 @@ class MeshHandler:
                         setattr(self, f"m_UV{uv_channel}", m_UV)
                         uvSrcOffset = uvDim * m_VertexCount
             else:
-                self.m_UV0 = unpack_floats(
-                    m_CompressedMesh.m_UV, 0, m_VertexCount * 2, shape=(2,)
-                )
+                self.m_UV0 = unpack_floats(m_CompressedMesh.m_UV, 0, m_VertexCount * 2, shape=(2,))
                 if m_CompressedMesh.m_UV.m_NumItems >= m_VertexCount * 4:
                     self.m_UV1 = unpack_floats(
                         m_CompressedMesh.m_UV,
@@ -539,8 +524,8 @@ class MeshHandler:
             normalData = unpack_floats(m_CompressedMesh.m_Normals, shape=(2,))
             signs = unpack_ints(m_CompressedMesh.m_NormalSigns)
 
-            self.m_Normals = zeros((m_CompressedMesh.m_Normals.m_NumItems // 2, 3))
-            for srcNrm, sign, dstNrm in zip(normalData, signs, self.m_Normals):
+            normals = zeros(self.m_VertexCount, 3)
+            for srcNrm, sign, dstNrm in zip(normalData, signs, normals):
                 x, y = srcNrm
                 zsqr = 1 - x * x - y * y
                 if zsqr >= 0:
@@ -551,15 +536,15 @@ class MeshHandler:
                     dstNrm[:] = normalize(x, y, z)
                 if sign == 0:
                     dstNrm[2] *= -1
+            self.m_Normals = lists_to_tuples(normals)
 
         # Tangent
         if m_CompressedMesh.m_Tangents.m_NumItems > 0:
             tangentData = unpack_floats(m_CompressedMesh.m_Tangents, shape=(2,))
-            signs = unpack_ints(m_CompressedMesh.m_TangentSigns)
-            self.m_Tangents = zeros((m_CompressedMesh.m_Tangents.m_NumItems // 2, 4))
-            for srcTan, (sign_z, sign_w), dstTan in zip(
-                tangentData, signs, self.m_Tangents
-            ):
+            signs = unpack_ints(m_CompressedMesh.m_TangentSigns, shape=(2,))
+
+            tangents = zeros(self.m_VertexCount, 4)
+            for srcTan, (sign_z, sign_w), dstTan in zip(tangentData, signs, tangents):
                 x, y = srcTan
                 zsqr = 1 - x * x - y * y
                 z = 0
@@ -572,6 +557,7 @@ class MeshHandler:
                     z = -z
                 w = 1.0 if sign_w > 0 else -1.0
                 dstTan[:] = x, y, z, w
+            self.m_Tangents = lists_to_tuples(tangents)
 
         # FloatColor
         if version[0] >= 5:  # 5.0 and up
@@ -581,45 +567,44 @@ class MeshHandler:
         # Skin
         if m_CompressedMesh.m_Weights.m_NumItems > 0:
             weightsData = unpack_ints(m_CompressedMesh.m_Weights)
-            weightsData = [weight / 31 for weight in weightsData]
             boneIndicesData = unpack_ints(m_CompressedMesh.m_BoneIndices)
 
             vertexIndex = 0
-            boneIndecesIndex = 0
             j = 0
             sum = 0
 
-            self.m_BoneWeights = zeros((m_CompressedMesh.m_Weights.m_NumItems // 4, 4))
-            self.m_BoneIndices = zeros((m_CompressedMesh.m_Weights.m_NumItems // 4, 4))
+            boneWeights = zeros(self.m_VertexCount, 4)
+            boneIndices = zeros(self.m_VertexCount, 4)
 
-            for weight in weightsData:
+            boneIndicesIterator = iter(boneIndicesData)
+            for weight, boneIndex in zip(weightsData, boneIndicesIterator):
                 # read bone index and weight
-                self.m_BoneWeights[vertexIndex][j] = weight
-                self.m_BoneIndices[vertexIndex][j] = boneIndicesData[boneIndecesIndex]
+                boneWeights[vertexIndex][j] = weight / 31
+                boneIndices[vertexIndex][j] = boneIndex
 
-                boneIndecesIndex += 1
                 j += 1
                 sum += weight
 
                 # the weights add up to one, continue with the next vertex.
-                if sum >= 1.0:
+                if sum >= 31:
                     j = 4
-
+                    # set weights and boneIndices to 0,
+                    # already done on init
                     vertexIndex += 1
                     j = 0
                     sum = 0
                 # we read three weights, but they don't add up to one. calculate the fourth one, and read
                 # missing bone index. continue with next vertex.
                 elif j == 3:  #
-                    self.m_BoneWeights[vertexIndex][j] = 1 - sum
-                    self.m_BoneIndices[vertexIndex][j] = boneIndicesData[
-                        boneIndecesIndex
-                    ]
+                    boneWeights[vertexIndex][j] = 1 - sum
+                    boneIndices[vertexIndex][j] = next(boneIndicesIterator)
 
-                    boneIndecesIndex += 1
                     vertexIndex += 1
                     j = 0
                     sum = 0
+
+            self.m_BoneWeights = lists_to_tuples(boneWeights)
+            self.m_BoneIndices = lists_to_tuples(boneIndices)
 
         # IndexBuffer
         if m_CompressedMesh.m_Triangles.m_NumItems > 0:  #
@@ -639,6 +624,7 @@ class MeshHandler:
 
     def get_triangles(self) -> List[List[Tuple[int, ...]]]:
         assert self.m_IndexBuffer is not None
+        assert self.src.m_SubMeshes is not None
 
         submeshes: List[List[Tuple[int, ...]]] = []
 
@@ -650,49 +636,43 @@ class MeshHandler:
             indexCount = m_SubMesh.indexCount
             topology = m_SubMesh.topology
 
-            triangles: List[int]
+            triangles: List[Tuple[int, ...]]
 
             if topology == MeshTopology.Triangles:
-                triangles = self.m_IndexBuffer[firstIndex : firstIndex + indexCount]
-            elif (
-                self.version[0] < 4 or topology == MeshTopology.TriangleStrip
-            ):  # TriangleStrip
-                # todo: use as_strided, then fix winding, finally remove degenerates
-                triIndex = 0
-                triangles = list((indexCount - 2) * 3)
+                triangles = [
+                    tuple(self.m_IndexBuffer[i : i + 3]) for i in range(firstIndex, firstIndex + indexCount, 3)
+                ]
 
-                for i in range(indexCount - 2):
-                    a, b, c = self.m_IndexBuffer[firstIndex + i : firstIndex + i + 3]
+            elif self.version[0] < 4 or topology == MeshTopology.TriangleStrip:
+                triangles = [()] * (indexCount - 2)
+                triIndex = 0
+                for i in range(firstIndex, firstIndex + indexCount - 2):
+                    a, b, c = self.m_IndexBuffer[i : i + 3]
                     # skip degenerates
                     if a == b or a == c or b == c:
                         continue
-
                     # do the winding flip-flop of strips
-                    if i & 1:
-                        triangles[triIndex] = b, a, c
+                    if (i - firstIndex) & 1:
+                        triangles[triIndex] = (b, a, c)
                     else:
-                        triangles[triIndex] = a, b, c
+                        triangles[triIndex] = (a, b, c)
                     triIndex += 1
-
                 triangles = triangles[:triIndex]
+                m_SubMesh.indexCount = len(triangles) * 3
 
             elif topology == MeshTopology.Quads:
                 # one quad is two triangles, so // 4 * 2 = // 2
-                # TODO: use as_strided
-                triangles = list(indexCount // 2, 3)
+                triangles = [()] * (indexCount // 2)
                 triIndex = 0
-                for a, b, c, d in self.m_IndexBuffer[
-                    firstIndex : firstIndex + indexCount : 4
-                ]:
-                    triangles[triIndex] = a, b, c
-                    triangles[triIndex + 1] = a, c, d
+                for i in range(firstIndex, firstIndex + indexCount, 4):
+                    a, b, c, d = self.m_IndexBuffer[i : i + 4]
+                    triangles[triIndex] = (a, b, c)
+                    triangles[triIndex + 1] = (a, c, d)
                     triIndex += 2
-            else:
-                raise ValueError(
-                    "Failed getting triangles. Submesh topology is lines or points."
-                )
 
-            triangles = [triangles[i : i + 3] for i in range(0, len(triangles), 3)]
+            else:
+                raise ValueError("Failed getting triangles. Submesh topology is lines or points.")
+
             submeshes.append(triangles)
 
         return submeshes
