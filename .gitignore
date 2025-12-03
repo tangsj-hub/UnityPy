@@ -102,3 +102,19 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+api/emote/*
+api/file/*
+api/Texture2D/*
+config/*
+fb_modules/*
+fb_library/*
+output/*
+output-e2/*
+output-emote/*
+output-material/*
+output20250810/*
+config.ini
+venv_arm64/*
+__init__.py
+.gitignore
+.DS_Store
